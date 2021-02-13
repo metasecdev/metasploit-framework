@@ -1,85 +1,90 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+class MetasploitModule < Msf::Auxiliary
+  include Msf::Exploit::Remote::SunRPC
+  include Msf::Auxiliary::Report
+  include Msf::Auxiliary::Scanner
 
-require 'msf/core'
+  def initialize
+    super(
+      'Name'        => 'SunRPC Portmap Program Enumerator',
+      'Description' => '
+        This module calls the target portmap service and enumerates all program
+        entries and their running port numbers.
+      ',
+      'Author'      => ['<tebo[at]attackresearch.com>'],
+      'References'  =>
+        [
+          ['URL',	'http://www.ietf.org/rfc/rfc1057.txt']
+        ],
+      'License'	=> MSF_LICENSE
+    )
 
-class Metasploit3 < Msf::Auxiliary
+    register_options([
+      OptEnum.new('PROTOCOL', [true, 'Protocol to use', 'tcp', %w[tcp udp]]),
+    ])
+  end
 
-	include Msf::Exploit::Remote::SunRPC
-	include Msf::Auxiliary::Report
-	include Msf::Auxiliary::Scanner
+  def run_host(ip)
+    peer = "#{ip}:#{rport}"
+    proto = datastore['PROTOCOL']
+    vprint_status "SunRPC - Enumerating programs"
 
-	def initialize
-		super(
-			'Name'          => 'SunRPC Portmap Program Enumerator',
-			'Description'   => %q{
-					This module calls the target portmap service and enumerates all
-				program entries and their running port numbers.
-			},
-			'Author'	       => ['<tebo [at] attackresearch.com>'],
-			'Version'       => '$Revision$',
-			'References'	 =>
-				[
-					['URL',	'http://www.ietf.org/rfc/rfc1057.txt'],
-				],
-			'License'	=> MSF_LICENSE
-		)
+    begin
+      program		= 100000
+      progver		= 2
+      procedure	= 4
 
-		register_options([], self.class)
-	end
+      sunrpc_create(proto, program, progver)
+      sunrpc_authnull
+      resp = sunrpc_call(procedure, "")
 
-	def run_host(ip)
+      progs = resp[3, 1].unpack('C')[0]
+      maps = []
+      if (progs == 0x01)
+        while Rex::Encoder::XDR.decode_int!(resp) == 1
+          maps << Rex::Encoder::XDR.decode!(resp, Integer, Integer, Integer, Integer)
+        end
+      end
+      sunrpc_destroy
+      return if maps.empty?
+      vprint_good("Found #{maps.size} programs available")
 
-		begin
-			program		= 100000
-			progver		= 2
-			procedure	= 4
+      table = Rex::Text::Table.new(
+        'Header'  => "SunRPC Programs for #{ip}",
+        'Indent'  => 1,
+        'Columns' => %w(Name Number Version Port Protocol)
+      )
 
-			sunrpc_create('udp', program, progver)
-			sunrpc_authnull()
-			resp = sunrpc_call(procedure, "")
+      maps.each do |map|
+        prog, vers, prot_num, port = map[0, 4]
+        thing = "RPC Program ##{prog} v#{vers} on port #{port} w/ protocol #{prot_num}"
+        if prot_num == 0x06
+          proto = 'tcp'
+        elsif prot_num == 0x11
+          proto = 'udp'
+        else
+          print_error("#{peer}: unknown protocol number for #{thing}")
+          next
+        end
 
-			progs = resp[3,1].unpack('C')[0]
-			if (progs == 0x01)
-				print_good("#{ip} - Programs available")
-				maps = []
-				while XDR.decode_int!(resp) == 1 do
-					map = XDR.decode!(resp, Integer, Integer, Integer, Integer)
-					maps << map
-				end
-			end
-			sunrpc_destroy
+        resolved = progresolv(prog)
+        table << [ resolved, prog, vers, port, proto ]
+        report_service(
+          host: ip,
+          port: port,
+          proto: proto,
+          name: resolved,
+          info: "Prog: #{prog} Version: #{vers} - via portmapper"
+        )
+      end
 
-			lines = []
-			maps.each do |map|
-				prog, vers, prot, port = map[0,4]
-				prot = 	if prot == 0x06; "tcp"
-					elsif prot == 0x11; "udp"
-					end
-				lines << "\t#{progresolv(prog)} - #{port}/#{prot}"
-
-				report_service(
-					:host => ip,
-					:port => port,
-					:proto => prot,
-					:name => progresolv(prog),
-					:info => "Prog: #{prog} Version: #{vers} - via portmapper"
-				)
-			end
-
-			# So we don't print a line for every program version
-			lines.uniq.each {|line| print_line(line)}
-
-		rescue ::Rex::Proto::SunRPC::RPCTimeout
-		end
-	end
-
+      print_good(table.to_s)
+    rescue ::Rex::Proto::SunRPC::RPCTimeout, ::Rex::Proto::SunRPC::RPCError => e
+      vprint_error(e.to_s)
+    end
+  end
 end
