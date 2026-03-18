@@ -9,7 +9,7 @@ require 'anemone/storage/base'
 
 module Anemone
 
-  VERSION = '0.5.0';
+  VERSION = '0.5.0'
 
   #
   # Convenience method to start a crawl
@@ -48,12 +48,13 @@ module Anemone
       :cookies => nil,
       # basic authentication data to send with HTTP requests
       :http_basic_auth => nil,
-      # array or raw header lines to inject into each request 
+      # array or raw header lines to inject into each request
       :inject_headers => [],
       # accept cookies from the server and send them back?
       :accept_cookies => false,
       # skip any link with a query string? e.g. http://foo.com/?u=user
-      :skip_query_strings => false
+      :skip_query_strings => false,
+      :dirbust  => true
     }
 
     # Create setter methods for all options to be called from the crawl block
@@ -77,7 +78,7 @@ module Anemone
       @skip_link_patterns = []
       @after_crawl_blocks = []
       @opts = opts
-      
+
       yield self if block_given?
     end
 
@@ -101,7 +102,7 @@ module Anemone
     end
 
     #
-    # Add one ore more Regex patterns for URLs which should not be
+    # Add one or more Regex patterns for URLs which should not be
     # followed
     #
     def skip_links_like(*patterns)
@@ -253,8 +254,18 @@ module Anemone
       !@pages.has_page?(link) &&
       !skip_link?(link) &&
       !skip_query_string?(link) &&
+      # Metasploit bug fix to ensure we don't continually traverse 404 pages
+      referred_from_valid_page?(from_page) &&
       allowed(link) &&
       !too_deep?(from_page)
+    end
+
+    def referred_from_valid_page?(page)
+      return true unless page && page.referer
+
+      # XXX This might need to handle differences between http and https schemes like '@pages.has_page?' implements
+      referer_http_status = @pages[page.referer.to_s].code
+      referer_http_status >= 100 && referer_http_status < 400
     end
 
     #
@@ -277,7 +288,7 @@ module Anemone
         false
       end
     end
-    
+
     #
     # Returns +true+ if *link* should not be visited because
     # it has a query string and +skip_query_strings+ is true.
@@ -297,10 +308,11 @@ module Anemone
     #
     # Kills all active threads
     #
-	def shutdown
+    def shutdown
       @tentacles.each {|t| t.kill rescue nil }
       @pages = nil
-	end
-	
+    end
+
   end
 end
+

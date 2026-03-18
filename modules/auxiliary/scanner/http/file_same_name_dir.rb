@@ -1,128 +1,122 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+class MetasploitModule < Msf::Auxiliary
+  include Msf::Exploit::Remote::HttpClient
+  include Msf::Auxiliary::WmapScanDir
+  include Msf::Auxiliary::Scanner
+  include Msf::Auxiliary::Report
 
-require 'rex/proto/http'
-require 'msf/core'
+  def initialize(info = {})
+    super(
+      update_info(
+        info,
+        'Name' => 'HTTP File Same Name Directory Scanner',
+        'Description'	=> %q{
+          This module identifies the existence of files
+          in a given directory path named as the same name of the
+          directory.
 
+          Only works if PATH is different than '/'.
+        },
+        'Author' => [ 'et [at] metasploit.com' ],
+        'License'	=> BSD_LICENSE,
+        'Notes' => {
+          'Reliability' => UNKNOWN_RELIABILITY,
+          'Stability' => UNKNOWN_STABILITY,
+          'SideEffects' => UNKNOWN_SIDE_EFFECTS
+        }
+      )
+    )
 
-class Metasploit3 < Msf::Auxiliary
+    register_options(
+      [
+        OptString.new('PATH', [ true, "The directory path  to identify files", '/']),
+        OptString.new('EXT', [ true, "File extension to use", '.aspx']),
 
-	include Msf::Exploit::Remote::HttpClient
-	include Msf::Auxiliary::WmapScanDir
-	include Msf::Auxiliary::Scanner
-	include Msf::Auxiliary::Report
+      ]
+    )
+  end
 
-	def initialize(info = {})
-		super(update_info(info,
-			'Name'   		=> 'HTTP File Same Name Directory Scanner',
-			'Description'	=> %q{
-				This module identifies the existence of files
-				in a given directory path named as the same name of the
-				directory.
+  def run_host(ip)
+    extensions = [
+      '.null',
+      '.backup',
+      '.bak',
+      '.c',
+      '.cfg',
+      '.class',
+      '.copy',
+      '.conf',
+      '.exe',
+      '.html',
+      '.htm',
+      '.log',
+      '.old',
+      '.orig',
+      '.php',
+      '.tar',
+      '.tar.gz',
+      '.tgz',
+      '.tmp',
+      '.temp',
+      '.txt',
+      '.zip',
+      '~',
+      ''
+    ]
 
-				Only works if PATH is differenet than '/'.
-			},
-			'Author' 		=> [ 'et [at] metasploit.com' ],
-			'License'		=> BSD_LICENSE,
-			'Version'		=> '$Revision$'))
+    tpath = normalize_uri(datastore['PATH'])
 
-		register_options(
-			[
-				OptString.new('PATH', [ true,  "The directory path  to identify files", '/']),
-				OptString.new('EXT', [ true, "File extension to use", '.aspx']),
+    if tpath.eql? "/" || ""
+      print_error("Blank or default PATH set.");
+      return
+    end
 
-			], self.class)
+    if tpath[-1, 1] != '/'
+      tpath += '/'
+    end
 
-	end
+    testf = tpath.split('/').last
 
-	def run_host(ip)
-		extensions = [
-			'.null',
-			'.backup',
-			'.bak',
-			'.c',
-			'.cfg',
-			'.class',
-			'.copy',
-			'.conf',
-			'.exe',
-			'.html',
-			'.htm',
-			'.log',
-			'.old',
-			'.orig',
-			'.php',
-			'.tar',
-			'.tar.gz',
-			'.tgz',
-			'.tmp',
-			'.temp',
-			'.txt',
-			'.zip',
-			'~',
-			''
-		]
+    extensions << datastore['EXT']
 
-		tpath = datastore['PATH']
+    extensions.each { |ext|
+      begin
+        testfext = testf.chomp + ext
+        res = send_request_cgi({
+          'uri' => tpath + testfext,
+          'method' => 'GET',
+          'ctype'	=> 'text/plain'
+        }, 20)
 
-		if tpath.eql? "/"||""
-			print_error("Blank or default PATH set.");
-			return
-		end
+        if (res and res.code >= 200 and res.code < 300)
+          print_good("Found #{wmap_base_url}#{tpath}#{testfext}")
 
-		if tpath[-1,1] != '/'
-			tpath += '/'
-		end
+          report_web_vuln(
+            :host	=> ip,
+            :port	=> rport,
+            :vhost => vhost,
+            :ssl => ssl,
+            :path	=> "#{tpath}#{testfext}",
+            :method => 'GET',
+            :pname => "",
+            :proof => "Res code: #{res.code.to_s}",
+            :risk => 0,
+            :confidence => 100,
+            :category => 'file',
+            :description => 'File found.',
+            :name => 'file'
+          )
 
-		testf = tpath.split('/').last
-
-		extensions << datastore['EXT']
-
-		extensions.each { |ext|
-			begin
-				testfext = testf.chomp + ext
-				res = send_request_cgi({
-					'uri'  		=>  tpath+testfext,
-					'method'   	=> 'GET',
-					'ctype'		=> 'text/plain'
-				}, 20)
-
-				if (res and res.code >= 200 and res.code < 300)
-					print_status("Found #{wmap_base_url}#{tpath}#{testfext}")
-
-					report_web_vuln(
-						:host	=> ip,
-						:port	=> rport,
-						:vhost  => vhost,
-						:ssl    => ssl,
-						:path	=> "#{tpath}#{testfext}",
-						:method => 'GET',
-						:pname  => "",
-						:proof  => "Res code: #{res.code.to_s}",
-						:risk   => 0,
-						:confidence   => 100,
-						:category     => 'file',
-						:description  => 'File found.',
-						:name   => 'file'
-					)
-
-				else
-					vprint_status("NOT Found #{wmap_base_url}#{tpath}#{testfext}")
-				end
-
-			rescue ::Rex::ConnectionRefused, ::Rex::HostUnreachable, ::Rex::ConnectionTimeout
-			rescue ::Timeout::Error, ::Errno::EPIPE
-			end
-
-		}
-
-	end
+        else
+          vprint_status("NOT Found #{wmap_base_url}#{tpath}#{testfext}")
+        end
+      rescue ::Rex::ConnectionRefused, ::Rex::HostUnreachable, ::Rex::ConnectionTimeout
+      rescue ::Timeout::Error, ::Errno::EPIPE
+      end
+    }
+  end
 end

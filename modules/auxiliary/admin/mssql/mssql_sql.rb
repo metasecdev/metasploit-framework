@@ -1,55 +1,67 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+class MetasploitModule < Msf::Auxiliary
+  include Msf::Exploit::Remote::MSSQL
+  include Msf::OptionalSession::MSSQL
 
-require 'msf/core'
+  def initialize(info = {})
+    super(
+      update_info(
+        info,
+        'Name' => 'Microsoft SQL Server Generic Query',
+        'Description' => %q{
+          This module will allow for simple SQL statements to be executed against a
+          MSSQL/MSDE instance given the appropriate credentials.
+        },
+        'Author' => [ 'tebo <tebo[at]attackresearch.com>' ],
+        'License' => MSF_LICENSE,
+        'References' => [
+          [ 'URL', 'http://www.attackresearch.com' ],
+          [ 'URL', 'http://msdn.microsoft.com/en-us/library/cc448435(PROT.10).aspx'],
+        ],
+        'Notes' => {
+          'Stability' => [CRASH_SAFE],
+          'SideEffects' => [IOC_IN_LOGS],
+          'Reliability' => []
+        }
+      )
+    )
 
+    register_options(
+      [
+        OptString.new('SQL', [ false, 'The SQL query to execute', 'select @@version']),
+      ]
+    )
+  end
 
-class Metasploit3 < Msf::Auxiliary
+  def auxiliary_commands
+    { 'select' => 'Run a select query (a LIMIT clause is probably a really good idea)' }
+  end
 
-	include Msf::Exploit::Remote::MSSQL
+  def cmd_select(*args)
+    datastore['SQL'] = "select #{args.join(' ')}"
+    run
+  end
 
-	def initialize(info = {})
-		super(update_info(info,
-			'Name'           => 'Microsoft SQL Server Generic Query',
-			'Description'    => %q{
-					This module will allow for simple SQL statements to be executed against a
-					MSSQL/MSDE instance given the appropiate credentials.
-			},
-			'Author'         => [ 'tebo <tebo [at] attackresearch [dot] com>' ],
-			'License'        => MSF_LICENSE,
-			'Version'        => '$Revision$',
-			'References'     =>
-				[
-					[ 'URL', 'http://www.attackresearch.com' ],
-					[ 'URL', 'http://msdn.microsoft.com/en-us/library/cc448435(PROT.10).aspx'],
-				]
-		))
+  def run
+    if session
+      set_mssql_session(session.client)
+    else
+      unless mssql_login_datastore
+        print_error('Error with mssql_login call')
+        info = mssql_client.initial_connection_info
+        if info[:errors] && !info[:errors].empty?
+          info[:errors].each do |err|
+            print_error(err)
+          end
+        end
+        return
+      end
+    end
 
-		register_options(
-			[
-				OptString.new('SQL', [ false, 'The SQL query to execute',  'select @@version']),
-			], self.class)
-	end
-
-	def auxiliary_commands
-		{ "select" => "Run a select query (a LIMIT clause is probably a really good idea)" }
-	end
-
-	def cmd_select(*args)
-		datastore["SQL"] = "select #{args.join(" ")}"
-		run
-	end
-
-	def run
-		mssql_query(datastore['SQL'], true) if mssql_login_datastore
-		disconnect
-	end
+    mssql_query(datastore['SQL'], true)
+  end
 end

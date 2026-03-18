@@ -1,110 +1,115 @@
 ##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-require 'rex'
-require 'msf/core'
-require 'msf/core/post/file'
-require 'msf/core/post/windows/registry'
 require 'yaml'
 
-class Metasploit3 < Msf::Post
+class MetasploitModule < Msf::Post
+  include Msf::Auxiliary::Report
+  include Msf::Post::File
+  include Msf::Post::Windows::Registry
 
-	include Msf::Auxiliary::Report
-	include Msf::Post::File
-	include Msf::Post::Windows::Registry
+  def initialize(info = {})
+    super(
+      update_info(
+        info,
+        'Name' => 'Windows Gather File and Registry Artifacts Enumeration',
+        'Description' => %q{
+          This module will check the file system and registry for particular artifacts.
 
-	def initialize(info={})
-		super( update_info( info,
-			'Name'          => 'Windows Gather File and Registry Artifacts Enumeration',
-			'Description'   => %q{
-				This module will check the file system and registry for particular artifacts. The
-				list of artifacts is read from data/post/enum_artifacts_list.txt or a user specified file. Any
-				matches are written to the loot. },
-			'License'       => MSF_LICENSE,
-			'Author'        => [ 'averagesecurityguy <stephen[at]averagesecurityguy.info>' ],
-			'Platform'      => [ 'windows' ],
-			'SessionTypes'  => [ 'meterpreter' ]
-		))
+          The list of artifacts is read in YAML format from data/post/enum_artifacts_list.txt
+          or a user specified file. Any matches are written to the loot.
+        },
+        'License' => MSF_LICENSE,
+        'Author' => [ 'averagesecurityguy <stephen[at]averagesecurityguy.info>' ],
+        'Platform' => [ 'win' ],
+        'SessionTypes' => %w[shell powershell meterpreter],
+        'Notes' => {
+          'Stability' => [CRASH_SAFE],
+          'Reliability' => [],
+          'SideEffects' => []
+        }
+      )
+    )
 
-		register_options(
-			[
-				OptPath.new( 'ARTIFACTS',
-					[
-						true,
-						'Full path to artifacts file.',
-						::File.join(Msf::Config.data_directory, 'post', 'enum_artifacts_list.txt')
-					])
-			], self.class)
-	end
+    register_options([
+      OptPath.new(
+        'ARTIFACTS',
+        [
+          true,
+          'Full path to artifacts file.',
+          ::File.join(Msf::Config.data_directory, 'post', 'enum_artifacts_list.txt')
+        ]
+      )
+    ])
+  end
 
-	def run
-		# Store any found artifacts so they can be written to loot
-		evidence = {}
+  def run
+    # Load artifacts from yaml file. Artifacts are organized by what they are evidence of.
+    begin
+      yaml = YAML.load_file(datastore['ARTIFACTS'])
+      raise 'File is not valid YAML' unless yaml.instance_of?(Hash)
+    rescue StandardError => e
+      fail_with(Failure::BadConfig, "Could not load artifacts YAML file '#{datastore['ARTIFACTS']}' : #{e.message}")
+    end
 
-		# Check artifacts file path
-		filename = datastore['ARTIFACTS']
-		if not ::File.exists?(filename)
-			print_error("Artifacts file does not exist!")
-			return
-		end
+    loot_data = ''
 
-		# Load artifacts from yaml file. Artifacts are organized by what they
-		# are evidence of.
-		yaml = YAML::load_file(filename)
-		yaml.each_key do |key|
-			print_status("Searching for artifacts of #{key}")
-			files = yaml[key]['files']
-			regs = yaml[key]['reg_entries']
-			found = []
+    yaml.each_key do |key|
+      print_status("Searching for artifacts of #{key}")
+      artifacts = []
 
-			# Process file entries
-			vprint_status("Processing #{files.length.to_s} file entries for #{key}.")
+      # Process file entries
+      files = yaml[key]['files']
+      vprint_status("Processing #{files.length} file entries for #{key} ...")
 
-			files.each do |file|
-				digest = file_remote_digestmd5(file['name'])
-				# if the file doesn't exist then digest will be nil
-				next if digest == nil
-				if digest == file['csum'] then found << file['name'] end
-			end
+      files.each do |file|
+        fname = file['name']
+        csum = file['csum']
 
-			# Process registry entries
-			vprint_status("Processing #{regs.length.to_s} registry entries for #{key}.")
+        digest = file_remote_digestmd5(fname)
+        if digest == csum
+          artifacts << fname
+        end
+      end
 
-			regs.each do |reg|
-				rdata = registry_getvaldata(reg['key'], reg['val'])
-				if rdata.to_s == reg['data']
-					found << reg['key'] + '\\' + reg['val']
-				end
-			end
+      # Process registry entries
+      regs = yaml[key]['reg_entries']
+      vprint_status("Processing #{regs.length} registry entries for #{key} ...")
 
-			# Did we find anything? If so store it in the evidence hash to be
-			# saved in the loot.
-			if found.empty?
-				print_status("No artifacts of #{key} found.")
-			else
-				print_status("Artifacts of #{key} found.")
-				evidence[key] = found
-			end
-		end
+      regs.each do |reg|
+        k = reg['key']
+        v = reg['val']
+        rdata = registry_getvaldata(k, v)
+        if rdata.to_s == reg['data']
+          artifacts << "#{k}\\#{v}"
+        end
+      end
 
-		save(evidence, "Enumerated Artifacts")
-	end
+      # Process matches
+      if artifacts.empty?
+        print_status("No artifacts of #{key} found.")
+        next
+      end
 
-	def save(data, name)
-		str = ""
-		data.each_pair do |key, val|
-			str << "Evidence of #{key} found.\n"
-			val.each do |v|
-				str << "\t" + v + "\n"
-			end
-		end
+      print_status("Artifacts of #{key} found.")
+      loot_data << "Evidence of #{key} found.\n"
+      loot_data << artifacts.map { |a| "\t#{a}\n" }.join
+    end
 
-		f = store_loot('enumerated.artifacts', 'text/plain', session, str, name)
-		print_status("#{name} stored in: #{f}")
-	end
+    return if loot_data.blank?
 
+    vprint_line(loot_data)
+
+    loot_name = 'Enumerated Artifacts'
+    f = store_loot(
+      loot_name.downcase.split.join('.'),
+      'text/plain',
+      session,
+      loot_data,
+      loot_name
+    )
+    print_good("#{loot_name} stored in: #{f}")
+  end
 end

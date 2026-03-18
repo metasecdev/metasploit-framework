@@ -1,4 +1,3 @@
-#!/usr/bin/env ruby
 # -*- coding: binary -*-
 
 require 'rex/post/thread'
@@ -20,161 +19,178 @@ module Sys
 ##
 class Thread < Rex::Post::Thread
 
-	include Rex::Post::Meterpreter::ObjectAliasesContainer
+  include Rex::Post::Meterpreter::ObjectAliasesContainer
 
-	##
-	#
-	# Constructor
-	#
-	##
+  ##
+  #
+  # Constructor
+  #
+  ##
 
-	#
-	# Initialize the thread instance.
-	#
-	def initialize(process, handle, tid)
-		self.process = process
-		self.handle  = handle
-		self.tid     = tid
-		ObjectSpace.define_finalizer( self, self.class.finalize(self.process.client, self.handle) )
-	end
+  #
+  # Initialize the thread instance.
+  #
+  def initialize(process, handle, tid)
+    self.process = process
+    self.handle  = handle
+    self.tid     = tid
 
-	def self.finalize(client,handle)
-		proc { self.close(client,handle) }
-	end
+    # Ensure the remote object is closed when all references are removed
+    ObjectSpace.define_finalizer(self, self.class.finalize(process.client, handle))
+  end
 
-	##
-	#
-	# Execution
-	#
-	##
+  def self.finalize(client,handle)
+    proc do
+      deferred_close_proc = proc do
+        begin
+          self.close(client, handle)
+        rescue => e
+          elog("finalize method for thread failed", error: e)
+        end
+      end
 
-	#
-	# Suspends the thread's execution.
-	#
-	def suspend
-		request = Packet.create_request('stdapi_sys_process_thread_suspend')
+      # Schedule the finalizing logic out-of-band; as this logic might be called in the context of a Signal.trap, which can't synchronize mutexes
+      client.framework.sessions.schedule(deferred_close_proc)
+    end
+  end
 
-		request.add_tlv(TLV_TYPE_THREAD_HANDLE, handle)
+  ##
+  #
+  # Execution
+  #
+  ##
 
-		process.client.send_request(request)
+  #
+  # Suspends the thread's execution.
+  #
+  def suspend
+    request = Packet.create_request(COMMAND_ID_STDAPI_SYS_PROCESS_THREAD_SUSPEND)
 
-		return true
-	end
+    request.add_tlv(TLV_TYPE_THREAD_HANDLE, handle)
 
-	#
-	# Resumes the thread's execution.
-	#
-	def resume
-		request = Packet.create_request('stdapi_sys_process_thread_resume')
+    process.client.send_request(request)
 
-		request.add_tlv(TLV_TYPE_THREAD_HANDLE, handle)
+    return true
+  end
 
-		process.client.send_request(request)
+  #
+  # Resumes the thread's execution.
+  #
+  def resume
+    request = Packet.create_request(COMMAND_ID_STDAPI_SYS_PROCESS_THREAD_RESUME)
 
-		return true
-	end
+    request.add_tlv(TLV_TYPE_THREAD_HANDLE, handle)
 
-	#
-	# Terminates the thread's execution.
-	#
-	def terminate(code)
-		request = Packet.create_request('stdapi_sys_process_thread_terminate')
+    process.client.send_request(request)
 
-		request.add_tlv(TLV_TYPE_THREAD_HANDLE, handle)
-		request.add_tlv(TLV_TYPE_EXIT_CODE, code)
+    return true
+  end
 
-		process.client.send_request(request)
+  #
+  # Terminates the thread's execution.
+  #
+  def terminate(code)
+    request = Packet.create_request(COMMAND_ID_STDAPI_SYS_PROCESS_THREAD_TERMINATE)
 
-		return true
-	end
+    request.add_tlv(TLV_TYPE_THREAD_HANDLE, handle)
+    request.add_tlv(TLV_TYPE_EXIT_CODE, code)
 
-	##
-	#
-	# Register manipulation
-	#
-	##
+    process.client.send_request(request)
 
-	#
-	# Queries the register state of the thread.
-	#
-	def query_regs
-		request = Packet.create_request('stdapi_sys_process_thread_query_regs')
-		regs    = {}
+    return true
+  end
 
-		request.add_tlv(TLV_TYPE_THREAD_HANDLE, handle)
+  ##
+  #
+  # Register manipulation
+  #
+  ##
 
-		response = process.client.send_request(request)
+  #
+  # Queries the register state of the thread.
+  #
+  def query_regs
+    request = Packet.create_request(COMMAND_ID_STDAPI_SYS_PROCESS_THREAD_QUERY_REGS)
+    regs    = {}
 
-		response.each(TLV_TYPE_REGISTER) { |reg|
-			regs[reg.get_tlv_value(TLV_TYPE_REGISTER_NAME)] = reg.get_tlv_value(TLV_TYPE_REGISTER_VALUE_32)
-		}
+    request.add_tlv(TLV_TYPE_THREAD_HANDLE, handle)
 
-		return regs
-	end
+    response = process.client.send_request(request)
 
-	#
-	# Sets the register state of the thread.  The registers are supplied
-	# in the form of a hash.
-	#
-	def set_regs(regs_hash)
-		request = Packet.create_request('stdapi_sys_process_thread_set_regs')
+    response.each(TLV_TYPE_REGISTER) { |reg|
+      regs[reg.get_tlv_value(TLV_TYPE_REGISTER_NAME)] = reg.get_tlv_value(TLV_TYPE_REGISTER_VALUE_32)
+    }
 
-		request.add_tlv(TLV_TYPE_THREAD_HANDLE, handle)
+    return regs
+  end
 
-		# Add all of the register that we're setting
-		regs_hash.each_key { |name|
-			t = request.add_tlv(TLV_TYPE_REGISTER)
+  #
+  # Sets the register state of the thread.  The registers are supplied
+  # in the form of a hash.
+  #
+  def set_regs(regs_hash)
+    request = Packet.create_request(COMMAND_ID_STDAPI_SYS_PROCESS_THREAD_SET_REGS)
 
-			t.add_tlv(TLV_TYPE_REGISTER_NAME, name)
-			t.add_tlv(TLV_TYPE_REGISTER_VALUE_32, regs_hash[name])
-		}
+    request.add_tlv(TLV_TYPE_THREAD_HANDLE, handle)
 
-		process.client.send_request(request)
+    # Add all of the register that we're setting
+    regs_hash.each_key { |name|
+      t = request.add_tlv(TLV_TYPE_REGISTER)
 
-		return true
-	end
+      t.add_tlv(TLV_TYPE_REGISTER_NAME, name)
+      t.add_tlv(TLV_TYPE_REGISTER_VALUE_32, regs_hash[name])
+    }
 
-	#
-	# Formats the registers in a pretty way.
-	#
-	def pretty_regs
-		regs = query_regs
+    process.client.send_request(request)
 
-		buf  = sprintf("eax=%.8x ebx=%.8x ecx=%.8x edx=%.8x esi=%.8x edi=%.8x\n",
-		               regs['eax'], regs['ebx'], regs['ecx'], regs['edx'], regs['esi'], regs['edi'])
-		buf += sprintf("eip=%.8x esp=%.8x ebp=%.8x\n",
-		               regs['eip'], regs['esp'], regs['ebp'])
-		buf += sprintf("cs=%.4x ss=%.4x ds=%.4x es=%.4x fs=%.4x gs=%.4x\n",
-		               regs['cs'], regs['ss'], regs['ds'], regs['es'], regs['fs'], regs['gs'])
+    return true
+  end
 
-		return buf
-	end
+  #
+  # Formats the registers in a pretty way.
+  #
+  def pretty_regs
+    regs = query_regs
 
-	##
-	#
-	# Closure
-	#
-	##
+    buf  = sprintf("eax=%.8x ebx=%.8x ecx=%.8x edx=%.8x esi=%.8x edi=%.8x\n",
+                   regs['eax'], regs['ebx'], regs['ecx'], regs['edx'], regs['esi'], regs['edi'])
+    buf += sprintf("eip=%.8x esp=%.8x ebp=%.8x\n",
+                   regs['eip'], regs['esp'], regs['ebp'])
+    buf += sprintf("cs=%.4x ss=%.4x ds=%.4x es=%.4x fs=%.4x gs=%.4x\n",
+                   regs['cs'], regs['ss'], regs['ds'], regs['es'], regs['fs'], regs['gs'])
 
-	#
-	# Closes the thread handle.
-	#
-	def self.close(client, handle)
-		request = Packet.create_request('stdapi_sys_process_thread_close')
-		request.add_tlv(TLV_TYPE_THREAD_HANDLE, handle)
-		client.send_request(request, nil)
-		handle = nil
-		return true
-	end
+    return buf
+  end
 
-	# Instance method
-	def close
-		self.class.close(self.process.client, self.handle)
-	end
+  ##
+  #
+  # Closure
+  #
+  ##
 
-	attr_reader :process, :handle, :tid # :nodoc:
+  #
+  # Closes the thread handle.
+  #
+  def self.close(client, handle)
+    request = Packet.create_request(COMMAND_ID_STDAPI_SYS_PROCESS_THREAD_CLOSE)
+    request.add_tlv(TLV_TYPE_THREAD_HANDLE, handle)
+    client.send_request(request, nil)
+    handle = nil
+    return true
+  end
+
+  # Instance method
+  def close
+    unless self.handle.nil?
+      ObjectSpace.undefine_finalizer(self)
+      self.class.close(self.process.client, self.handle)
+      self.handle = nil
+    end
+  end
+
+  attr_reader :process, :handle, :tid # :nodoc:
 protected
-	attr_writer :process, :handle, :tid # :nodoc:
+  attr_writer :process, :handle, :tid # :nodoc:
 
 end
 

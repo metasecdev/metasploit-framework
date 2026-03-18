@@ -1,191 +1,196 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+class MetasploitModule < Msf::Auxiliary
+  include Msf::Exploit::Remote::HttpClient
+  include Msf::Auxiliary::WmapScanServer
+  include Msf::Auxiliary::Scanner
+  include Msf::Auxiliary::Report
 
-require 'rex/proto/http'
-require 'msf/core'
+  def initialize(info = {})
+    super(
+      update_info(
+        info,
+        'Name' => 'HTTP Vuln Scanner',
+        'Description'	=> %q{
+          This module identifies common vulnerable files or cgis.
+        },
+        'Author' => [ 'et' ],
+        'License'	=> BSD_LICENSE,
+        'Notes' => {
+          'Reliability' => UNKNOWN_RELIABILITY,
+          'Stability' => UNKNOWN_STABILITY,
+          'SideEffects' => UNKNOWN_SIDE_EFFECTS
+        }
+      )
+    )
 
-class Metasploit3 < Msf::Auxiliary
+    register_options(
+      [
+        OptString.new('PATH', [ true, "Original test path", '/']),
+        OptPath.new('VULNCSV', [ true, "Path of vulnerabilities csv file to use" ])
+      ]
+    )
 
-	include Msf::Exploit::Remote::HttpClient
-	include Msf::Auxiliary::WmapScanServer
-	include Msf::Auxiliary::Scanner
-	include Msf::Auxiliary::Report
+    register_advanced_options(
+      [
+        OptInt.new('ErrorCode', [ true, "The expected http code for non existent files", 404]),
+        OptPath.new('HTTP404Sigs', [
+          false, "Path of 404 signatures to use",
+          File.join(Msf::Config.data_directory, "wmap", "wmap_404s.txt")
+        ]),
+        OptBool.new('NoDetailMessages', [ false, "Do not display detailed test messages", true ]),
+        OptBool.new('ForceCode', [ false, "Force detection using HTTP code", false ]),
+        OptInt.new('TestThreads', [ true, "Number of test threads", 25])
+      ]
+    )
+  end
 
-	def initialize(info = {})
-		super(update_info(info,
-			'Name'   		=> 'HTTP Vuln scanner',
-			'Description'	=> %q{
-				This module identifies common vulnerable files or cgis.
-			},
-			'Author' 		=> [ 'et' ],
-			'License'		=> BSD_LICENSE,
-			'Version'		=> '$Revision$'))
+  # Modify to true if you have sqlmap installed.
+  def wmap_enabled
+    false
+  end
 
-		register_options(
-			[
-				OptString.new('PATH', [ true, "Original test path", '/']),
-				OptPath.new('VULNCSV',[ true, "Path of vulnerabilities csv file to use" ])
-			], self.class)
+  def run_host(ip)
+    conn = false
+    usecode = datastore['ForceCode']
 
-		register_advanced_options(
-			[
-				OptInt.new('ErrorCode', [ true,  "The expected http code for non existant files", 404]),
-				OptPath.new('HTTP404Sigs',   [ false, "Path of 404 signatures to use",
-						File.join(Msf::Config.install_root, "data", "wmap", "wmap_404s.txt")
-					]
-				),
-				OptBool.new('NoDetailMessages', [ false, "Do not display detailed test messages", true ]),
-				OptBool.new('ForceCode', [ false, "Force detection using HTTP code", false ]),
-				OptInt.new('TestThreads', [ true, "Number of test threads", 25])
-			], self.class)
+    tpath = normalize_uri(datastore['PATH'])
+    if tpath[-1, 1] != '/'
+      tpath += '/'
+    end
 
-	end
+    nt = datastore['TestThreads'].to_i
+    nt = 1 if nt == 0
 
-	# Modify to true if you have sqlmap installed.
-	def wmap_enabled
-		false
-	end
+    dm = datastore['NoDetailMessages']
 
-	def run_host(ip)
-		conn = false
-		usecode = datastore['ForceCode']
+    queue = []
 
-		tpath = datastore['PATH']
-		if tpath[-1,1] != '/'
-			tpath += '/'
-		end
+    File.open(datastore['VULNCSV'], 'rb').each do |testf|
+      queue << testf.strip
+    end
 
-		nt = datastore['TestThreads'].to_i
-		nt = 1 if nt == 0
+    #
+    # Detect error code
+    #
+    ecode = datastore['ErrorCode'].to_i
+    begin
+      randfile = Rex::Text.rand_text_alpha(5).chomp
 
-		dm = datastore['NoDetailMessages']
+      res = send_request_cgi({
+        'uri' => tpath + randfile,
+        'method' => 'GET',
+        'ctype'	=> 'text/html'
+      }, 20)
 
-		queue = []
+      return if not res
 
-		File.open(datastore['VULNCSV'], 'rb').each do |testf|
-			queue << testf.strip
-		end
+      tcode = res.code.to_i
 
-		#
-		# Detect error code
-		#
-		ecode = datastore['ErrorCode'].to_i
-		begin
-			randfile = Rex::Text.rand_text_alpha(5).chomp
+      # Look for a string we can signature on as well
+      if (tcode >= 200 and tcode <= 299)
+        File.open(datastore['HTTP404Sigs'], 'rb').each do |str|
+          if (res.body.index(str))
+            emesg = str
+            break
+          end
+        end
 
-			res = send_request_cgi({
-				'uri'  		=>  tpath+randfile,
-				'method'   	=> 'GET',
-				'ctype'		=> 'text/html'
-			}, 20)
+        if (not emesg)
+          print_status("Using first 256 bytes of the response as 404 string")
+          emesg = res.body[0, 256]
+        else
+          print_status("Using custom 404 string of '#{emesg}'")
+        end
+      else
+        ecode = tcode
+        print_status("Using code '#{ecode}' as not found.")
+      end
+    rescue ::Rex::ConnectionRefused, ::Rex::HostUnreachable, ::Rex::ConnectionTimeout
+      conn = false
+    rescue ::Timeout::Error, ::Errno::EPIPE
+    end
 
-			return if not res
+    while (not queue.empty?)
+      t = []
+      1.upto(nt) do
+        t << framework.threads.spawn("Module(#{self.refname})-#{rhost}", false, queue.shift) do |testf|
+          Thread.current.kill if not testf
 
-			tcode = res.code.to_i
+          testarr = []
+          testfvuln = ""
+          testmesg = ""
+          testnote = ""
+          foundstr = false
 
-			# Look for a string we can signature on as well
-			if(tcode >= 200 and tcode <= 299)
-				File.open(datastore['HTTP404Sigs'], 'rb').each do |str|
-					if(res.body.index(str))
-						emesg = str
-						break
-					end
-				end
+          testarr = testf.split(',')
 
-				if(not emesg)
-					print_status("Using first 256 bytes of the response as 404 string")
-					emesg = res.body[0,256]
-				else
-					print_status("Using custom 404 string of '#{emesg}'")
-				end
-			else
-				ecode = tcode
-				print_status("Using code '#{ecode}' as not found.")
-			end
+          testfvuln = testarr[0].to_s
+          testmesg = testarr[1].to_s
+          testnote = testarr[2].to_s
 
-		rescue ::Rex::ConnectionRefused, ::Rex::HostUnreachable, ::Rex::ConnectionTimeout
-			conn = false
-		rescue ::Timeout::Error, ::Errno::EPIPE
-		end
+          res = send_request_cgi({
+            'uri' => tpath + testfvuln,
+            'method' => 'GET',
+            'ctype'	=> 'text/plain'
+          }, 20)
 
+          if res.nil?
+            print_error("Connection timed out")
+            return
+          end
 
-		while(not queue.empty?)
-			t = []
-			1.upto(nt) do
-				t << framework.threads.spawn("Module(#{self.refname})-#{rhost}", false, queue.shift) do |testf|
-					Thread.current.kill if not testf
+          if testmesg.empty? or usecode
+            if (res.code.to_i == ecode) or (emesg and res.body.index(emesg))
+              if dm == false
+                print_status("NOT Found #{wmap_base_url}#{tpath}#{testfvuln}  #{res.code.to_i}")
+              end
+            else
+              if res.code.to_i == 400 and ecode != 400
+                print_error("Server returned an error code. #{wmap_base_url}#{tpath}#{testfvuln} #{res.code.to_i}")
+              else
+                print_good("FOUND #{wmap_base_url}#{tpath}#{testfvuln} [#{res.code.to_i}] #{testnote}")
 
-					testarr = []
-					testfvuln = ""
-					testmesg = ""
-					testnote = ""
-					foundstr = false
+                report_note(
+                  :host	=> ip,
+                  :proto => 'tcp',
+                  :sname => (ssl ? 'https' : 'http'),
+                  :port	=> rport,
+                  :type	=> 'FILE',
+                  :data	=> {
+                    :path => "#{tpath}#{testfvuln}",
+                    :status => res.code
+                  }
+                )
+              end
+            end
+          else
+            if res and res.body.include?(testmesg)
+              print_good("FOUND #{wmap_base_url}#{tpath}#{testfvuln} [#{res.code.to_i}] #{testnote}")
 
-					testarr = testf.split(',')
-
-					testfvuln = testarr[0].to_s
-					testmesg = testarr[1].to_s
-					testnote = testarr[2].to_s
-
-					res = send_request_cgi({
-						'uri'  		=>  tpath+testfvuln,
-						'method'   	=> 'GET',
-						'ctype'		=> 'text/plain'
-					}, 20)
-
-
-					if testmesg.empty? or usecode
-						if(not res or ((res.code.to_i == ecode) or (emesg and res.body.index(emesg))))
-							if dm == false
-								print_status("NOT Found #{wmap_base_url}#{tpath}#{testfvuln}  #{res.code.to_i}")
-								#blah
-							end
-						else
-							if res.code.to_i == 400  and ecode != 400
-								print_error("Server returned an error code. #{wmap_base_url}#{tpath}#{testfvuln} #{res.code.to_i}")
-							else
-								print_status("FOUND #{wmap_base_url}#{tpath}#{testfvuln} [#{res.code.to_i}] #{testnote}")
-
-								report_note(
-									:host	=> ip,
-									:proto => 'tcp',
-									:sname => (ssl ? 'https' : 'http'),
-									:port	=> rport,
-									:type	=> 'FILE',
-									:data	=> "#{tpath}#{testfvuln} Code: #{res.code}"
-								)
-							end
-						end
-					else
-						if res and res.body.include?(testmesg)
-							print_status("FOUND #{wmap_base_url}#{tpath}#{testfvuln} [#{res.code.to_i}] #{testnote}")
-
-							report_note(
-									:host	=> ip,
-									:proto => 'tcp',
-									:sname => (ssl ? 'https' : 'http'),
-									:port	=> rport,
-									:type	=> 'FILE',
-									:data	=> "#{tpath}#{testfvuln} Code: #{res.code}"
-							)
-						else
-							if dm == false
-								print_status("NOT Found #{wmap_base_url}#{tpath}#{testfvuln}  #{res.code.to_i}")
-								#blah
-							end
-						end
-					end
-				end
-			end
-			t.map{|x| x.join }
-		end
-	end
+              report_note(
+                :host	=> ip,
+                :proto => 'tcp',
+                :sname => (ssl ? 'https' : 'http'),
+                :port	=> rport,
+                :type	=> 'FILE',
+                :data	=> {
+                  :path => "#{tpath}#{testfvuln}",
+                  :status => res.code
+                }
+              )
+            else
+              if dm == false
+                print_status("NOT Found #{wmap_base_url}#{tpath}#{testfvuln}  #{res.code.to_i}")
+              end
+            end
+          end
+        end
+      end
+      t.map { |x| x.join }
+    end
+  end
 end

@@ -1,103 +1,134 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+class MetasploitModule < Msf::Post
+  include Msf::Post::Windows::Services
 
+  def initialize(info = {})
+    super(
+      update_info(
+        info,
+        'Name' => 'Windows Gather Service Info Enumeration',
+        'Description' => %q{
+          This module will query the system for services and display name and
+          configuration info for each returned service. It allows you to
+          optionally search the credentials, path, or start type for a string
+          and only return the results that match. These query operations are
+          cumulative and if no query strings are specified, it just returns all
+          services.  NOTE: If the script hangs, windows firewall is most likely
+          on and you did not migrate to a safe process (explorer.exe for
+          example).
+        },
+        'License' => MSF_LICENSE,
+        'Author' => ['Keith Faber', 'Kx499'],
+        'Platform' => ['win'],
+        'SessionTypes' => %w[meterpreter powershell shell],
+        'Notes' => {
+          'Stability' => [CRASH_SAFE],
+          'Reliability' => [],
+          'SideEffects' => []
+        }
+      )
+    )
+    register_options([
+      OptString.new('CRED', [ false, 'String to search credentials for' ]),
+      OptString.new('PATH', [ false, 'String to search path for' ]),
+      OptEnum.new('TYPE', [true, 'Service startup option', 'All', ['All', 'Auto', 'Manual', 'Disabled' ]])
+    ])
+  end
 
-require 'msf/core'
-require 'rex'
-require 'msf/core/post/windows/services'
+  def run
+    credential_count = {}
+    qcred = datastore['CRED'] || nil
+    qpath = datastore['PATH'] || nil
 
-class Metasploit3 < Msf::Post
+    if datastore['TYPE'] == 'All'
+      qtype = nil
+    else
+      qtype = datastore['TYPE'].downcase
+      print_status("Start Type Filter: #{qtype}")
+    end
 
-	include Msf::Post::Windows::WindowsServices
+    if qcred
+      qcred = qcred.downcase
+      print_status("Credential Filter: #{qcred}")
+    end
 
-	def initialize(info={})
-		super(update_info(info,
-			'Name'                 => "Windows Gather Service Info Enumeration",
-			'Description'          => %q{
-				This module will query the system for services and display name and configuration
-				info for each returned service. It allows you to optionally search the credentials, path, or start
-				type for a string and only return the results that match. These query operations
-				are cumulative and if no query strings are specified, it just returns all services.
-				NOTE: If the script hangs, windows firewall is most likely on and you did not
-				migrate to a safe process (explorer.exe for example).
-				},
-			'License'              => MSF_LICENSE,
-			'Version'              => '$Revision$',
-			'Platform'             => ['windows'],
-			'SessionTypes'         => ['meterpreter'],
-			'Author'               => ['Keith Faber', 'Kx499']
-		))
-		register_options(
-			[
-				OptString.new('CRED', [ false, 'String to search credentials for' ]),
-				OptString.new('PATH', [ false, 'String to search path for' ]),
-				OptEnum.new('TYPE', [false, 'Service startup Option', 'All', ['All', 'Auto', 'Manual', 'Disabled' ]])
-			], self.class)
-	end
+    if qpath
+      qpath = qpath.downcase
+      print_status("Executable Path Filter: #{qpath}")
+    end
 
+    results_table = Rex::Text::Table.new(
+      'Header' => 'Services',
+      'Indent' => 1,
+      'SortIndex' => 0,
+      'Columns' => ['Name', 'Credentials', 'Command', 'Startup']
+    )
 
-	def run
+    print_status('Listing Service Info for matching services, please wait...')
 
-		# set vars
-		qcred = datastore["CRED"] || nil
-		qpath = datastore["PATH"] || nil
-		if datastore["TYPE"] == "All"
-			qtype = nil
-		else
-			qtype = datastore["TYPE"]
-		end
-		if qcred
-			print_status("Credential Filter: " + qcred)
-		end
-		if qpath
-			print_status("Executable Path Filter: " + qpath)
-		end
-		if qtype
-			print_status("Start Type Filter: " + qtype)
-		end
+    services = service_list
 
-		print_status("Listing Service Info for matching services:")
-		service_list.each do |sname|
-			srv_conf = {}
-			isgood = true
-			#make sure we got a service name
-			if sname
-				begin
-					srv_conf = service_info(sname)
-					#filter service based on filters passed, the are cumulative
-					if qcred and ! srv_conf['Credentials'].downcase.include? qcred.downcase
-						isgood = false
-					end
-					if qpath and ! srv_conf['Command'].downcase.include? qpath.downcase
-						isgood = false
-					end
-					if qtype and ! srv_conf['Startup'].downcase.include? qtype.downcase
-						isgood = false
-					end
+    vprint_status("Found #{services.length} Windows services")
 
-					#if we are still good return the info
-					if isgood
-						vprint_status("\tName: #{sname}")
-						vprint_good("\t\tStartup: #{srv_conf['Startup']}")
-						vprint_good("\t\tCommand: #{srv_conf['Command']}")
-						vprint_good("\t\tCredentials: #{srv_conf['Credentials']}")
-					end
-				rescue
-					print_error("An error occured enumerating service: #{sname}")
-				end
-			else
-				print_error("Problem enumerating services")
-			end
+    services.each do |srv|
+      srv_conf = {}
 
-		end
-	end
+      # make sure we got a service name
+      if srv[:name].blank?
+        print_error("Problem retrieving service information - no name found for service: #{srv}")
+        next
+      end
 
+      begin
+        srv_conf = service_info(srv[:name])
+
+        next unless srv_conf && srv_conf[:startname] && srv_conf[:path]
+
+        # filter service based on provided filters
+        next if qcred && !srv_conf[:startname].downcase.include?(qcred)
+        next if qpath && !srv_conf[:path].downcase.include?(qpath)
+
+        # There may not be a 'Startup', need to check nil
+        start_type = srv_conf[:starttype]
+        start_type = start_type.blank? ? '' : START_TYPE[start_type].to_s
+
+        next if qtype && !start_type.downcase.include?(qtype)
+
+        # count the occurance of specific credentials services are running as
+        service_cred = srv_conf[:startname].upcase
+        unless service_cred.empty?
+          if credential_count.key?(service_cred)
+            credential_count[service_cred] += 1
+          else
+            credential_count[service_cred] = 1
+            # let the user know a new service account has been detected for possible lateral
+            # movement opportunities
+            print_good("New service credential detected: #{srv[:name]} is running as '#{srv_conf[:startname]}'")
+          end
+        end
+
+        results_table << [
+          srv[:name],
+          srv_conf[:startname],
+          start_type,
+          srv_conf[:path]
+        ]
+      rescue RuntimeError => e
+        print_error("An error occurred enumerating service: #{srv[:name]}: #{e}")
+      end
+    end
+
+    print_status("Found #{results_table.rows.size} Windows services matching filters")
+
+    return if results_table.rows.empty?
+
+    print_line("\n#{results_table}")
+
+    p = store_loot('windows.services', 'text/plain', session, results_table.to_s, 'windows_services.txt', 'Windows Services')
+    print_good("Loot file stored in: #{p}")
+  end
 end

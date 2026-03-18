@@ -1,5 +1,4 @@
 # -*- coding: binary -*-
-require 'rex/ui'
 
 module Rex
 module Ui
@@ -14,64 +13,68 @@ require 'rex/io/stream_abstraction'
 ###
 class Input::Buffer < Rex::Ui::Text::Input
 
-	class BufferSock
-		include Rex::IO::StreamAbstraction
-		def write(buf, opts={})
-			syswrite(buf)
-		end
-	end
+  class BufferSock
+    include Rex::IO::StreamAbstraction
+    def write(buf, opts={})
+      syswrite(buf)
+    end
 
-	def initialize
-		@sock = BufferSock.new
-		@sock.initialize_abstraction
-	end
+    def monitor_rsock(*args, **kwargs)
+      dlog('monitor_rsock: Skipping - functionality not required')
+    end
+  end
 
-	def close
-		@sock.cleanup_abstraction
-	end
+  def initialize
+    @sock = BufferSock.new
+    @sock.initialize_abstraction
+  end
 
-	def sysread(len = 1)
-		@sock.rsock.sysread(len)
-	end
+  def close
+    @sock.cleanup_abstraction
+  end
 
-	def put(msg, opts={})
-		@sock.lsock.write(msg)
-	end
+  def sysread(len = 1)
+    @sock.rsock.sysread(len)
+  end
 
-	#
-	# Wait for a line of input to be read from a socket.
-	#
-	def gets
-		# Initialize the line buffer
-		line = ''
+  def put(msg, opts={})
+    @sock.lsock.write(msg)
+  end
 
-		# Read data one byte at a time until we see a LF
-		while (true)
-			break if line.include?("\n")
+  #
+  # Wait for a line of input to be read from a socket.
+  #
+  def gets
+    # Initialize the line buffer
+    line = ''
 
-			# Read another character of input
-			char = @sock.rsock.getc
+    # Read data one byte at a time until we see a LF
+    while (true)
+      break if line.include?("\n")
 
-			# Append this character to the string
-			line << char
-		end
+      # Read another character of input
+      char = @sock.rsock.getc
 
-		return line
-	end
+      # Append this character to the string
+      line << char
+    end
 
-	#
-	# Returns whether or not EOF has been reached on stdin.
-	#
-	def eof?
-		@sock.lsock.closed?
-	end
+    return line
+  end
 
-	#
-	# Returns the file descriptor associated with a socket.
-	#
-	def fd
-		return @sock.rsock
-	end
+  #
+  # Returns whether or not EOF has been reached on stdin.
+  #
+  def eof?
+    @sock.lsock.closed?
+  end
+
+  #
+  # Returns the file descriptor associated with a socket.
+  #
+  def fd
+    return @sock.rsock
+  end
 end
 
 end

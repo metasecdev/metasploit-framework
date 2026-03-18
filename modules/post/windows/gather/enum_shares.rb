@@ -1,189 +1,208 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+class MetasploitModule < Msf::Post
+  include Msf::Post::Windows::Registry
+  include Msf::Post::Windows::Priv
 
-require 'msf/core'
-require 'rex'
-require 'msf/core/post/windows/registry'
-require 'msf/core/post/windows/priv'
+  SID_PREFIX_USER = 'S-1-5-21-'.freeze
 
-class Metasploit3 < Msf::Post
+  def initialize(info = {})
+    super(
+      update_info(
+        info,
+        'Name' => 'Windows Gather SMB Share Enumeration via Registry',
+        'Description' => %q{ This module will enumerate configured and recently used file shares. },
+        'License' => MSF_LICENSE,
+        'Author' => [ 'Carlos Perez <carlos_perez[at]darkoperator.com>' ],
+        'Platform' => [ 'win' ],
+        'SessionTypes' => %w[shell powershell meterpreter],
+        'Notes' => {
+          'Stability' => [CRASH_SAFE],
+          'Reliability' => [],
+          'SideEffects' => []
+        },
+        'Compat' => {
+          'Meterpreter' => {
+            'Commands' => %w[
+              stdapi_registry_open_key
+              stdapi_registry_check_key_exists
+            ]
+          }
+        }
+      )
+    )
+    register_options([
+      OptBool.new('CURRENT', [ true, 'Enumerate currently configured shares', true]),
+      OptBool.new('RECENT', [ true, 'Enumerate recently mapped shares', true]),
+      OptBool.new('ENTERED', [ true, 'Enumerate recently entered UNC Paths in the Run Dialog', true])
+    ])
+  end
 
-	include Msf::Post::Windows::Registry
-	include Msf::Post::Windows::Priv
+  # Convert share type ID `val` to readable string
+  #
+  # @return [String] Share type as readable string
+  def share_type(val)
+    %w[DISK PRINTER DEVICE IPC SPECIAL TEMPORARY][val] || 'UNKNOWN'
+  end
 
-	def initialize(info={})
-		super( update_info( info,
-				'Name'          => 'Windows Gather SMB Share Enumeration via Registry',
-				'Description'   => %q{ This module will enumerate configured and recently used file shares},
-				'License'       => MSF_LICENSE,
-				'Author'        => [ 'Carlos Perez <carlos_perez[at]darkoperator.com>'],
-				'Version'       => '$Revision$',
-				'Platform'      => [ 'windows' ],
-				'SessionTypes'  => [ 'meterpreter' ]
-			))
-		register_options(
-			[
-				OptBool.new("CURRENT" , [ true, "Enumerate currently configured shares"                  , true]),
-				OptBool.new("RECENT"  , [ true, "Enumerate Recently mapped shares"                       , true]),
-				OptBool.new("ENTERED" , [ true, "Enumerate Recently entered UNC Paths in the Run Dialog" , true])
-			], self.class)
+  # Method for enumerating recent mapped drives on target machine
+  #
+  # @return [Array] List of recently mounted UNC paths
+  def enum_recent_mounts(base_key)
+    partial_path = base_key + '\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer'
+    explorer_keys = registry_enumkeys(partial_path).to_s || ''
 
-	end
+    return [] unless explorer_keys.include?('Map Network Drive MRU')
 
-	# Stolen from modules/auxiliary/scanner/smb/smb_enumshares.rb
-	def share_type(val)
-		stypes = [
-			'DISK',
-			'PRINTER',
-			'DEVICE',
-			'IPC',
-			'SPECIAL',
-			'TEMPORARY'
-		]
+    full_path = "#{partial_path}\\Map Network Drive MRU"
+    vals_found = registry_enumvals(full_path)
 
-		if val > (stypes.length - 1)
-			return 'UNKNOWN'
-		end
+    return [] unless vals_found
 
-		stypes[val]
-	end
+    recent_mounts = []
+    registry_enumvals(full_path).each do |k|
+      next if k.include?('MRUList')
 
-	# Method for enumerating recent mapped drives on target machine
-	def enum_recent_mounts(base_key)
-		recent_mounts = []
-		partial_path = base_key + "\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer"
-		full_path = "#{partial_path}\\Map Network Drive MRU"
-		explorer_keys = registry_enumkeys(partial_path)
-		if explorer_keys.include?("Map Network Drive MRU")
-			vals_found = registry_enumvals(full_path)
-			if vals_found
-				registry_enumvals(full_path).each do |k|
-					if not k =~ /MRUList/
-						recent_mounts << registry_getvaldata(full_path,k)
-					end
-				end
-			end
-		end
-		return recent_mounts
-	end
+      mounted_path = registry_getvaldata(full_path, k)
+      recent_mounts << mounted_path if mounted_path.starts_with?('\\\\')
+    end
 
-	# Method for enumerating UNC Paths entered in run dialog box
-	def enum_run_unc(base_key)
-		unc_paths = []
-		full_path = base_key + "\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RunMRU"
-		vals_found = registry_enumvals(full_path)
-		if vals_found
-			vals_found.each do |k|
-				if k =~ /./
-					run_entrie = registry_getvaldata(full_path,k)
-					unc_paths << run_entrie if run_entrie =~ /^\\\\/
-				end
-			end
-		end
+    recent_mounts
+  end
 
-		return unc_paths
-	end
+  # Method for enumerating UNC paths entered in Run dialog box
+  #
+  # @return [Array] List of MRU historical UNC paths
+  def enum_run_unc(base_key)
+    full_path = base_key + '\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RunMRU'
+    vals_found = registry_enumvals(full_path)
 
-	# Method for enumerating configured shares on a target box
-	def enum_conf_shares()
-		if sysinfo["OS"] =~ /Windows 7|Vista|2008/
-			shares_key = "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\services\\LanmanServer\\Shares"
-		else
-			shares_key = "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\services\\lanmanserver\\Shares"
-		end
-		share_names = registry_enumvals(shares_key)
+    return [] unless vals_found
 
-		if share_names.length > 0
-			shares = []
-			print_status("The following shares were found:")
-			share_names.each do |sname|
-				info = registry_getvaldata(shares_key,sname)
-				next if info.nil?
-				share_info = info.split("\000")
-				print_status("\tName: #{sname}")
-				stype = remark = path = nil
-				share_info.each do |e|
-					name,val = e.split("=")
-					case name
-					when "Path"
-						print_status "\tPath: #{val}"
-						path = val
-					when "Type"
-						print_status "\tType: #{val}"
-						stype = share_type(val.to_i)
-					when "Remark"
-						remark = val
-					end
-				end
-				# Match the format used by auxiliary/scanner/smb/smb_enumshares
-				# with an added field for path
-				shares << [ sname, stype, remark, path ]
-				print_status()
-			end
-			report_note(
-				:host => session,
-				:type => 'smb.shares',
-				:data => { :shares => shares },
-				:update => :unique_data
-			)
-		else
-			print_status("No shares were found")
-		end
-	end
+    unc_paths = []
+    vals_found.each do |k|
+      next if k.include?('MRUList')
 
-	def run
-		print_status("Running against session #{datastore["SESSION"]}")
+      run_entry = registry_getvaldata(full_path, k).to_s
+      unc_paths << run_entry.gsub(/\\1$/, '') if run_entry.starts_with?('\\\\')
+    end
 
-		# Variables to hold info
-		mount_history = []
-		run_history = []
+    unc_paths
+  end
 
-		# Enumerate shares being offered
-		enum_conf_shares() if datastore["CURRENT"]
-		if is_system?
-			mount_history = enum_recent_mounts("HKEY_CURRENT_USER")
-			run_history = enum_run_unc("HKEY_CURRENT_USER")
-		else
-			user_sid = []
-			key = "HKU\\"
-			root_key, base_key = session.sys.registry.splitkey(key)
-			open_key = session.sys.registry.open_key(root_key, base_key)
-			keys = open_key.enum_key
-			keys.each do |k|
-				user_sid << k if k =~ /S-1-5-21-\d*-\d*-\d*-\d{3,6}$/
-			end
-			user_sid.each do |us|
-				mount_history = mount_history + enum_recent_mounts("HKU\\#{us.chomp}") if datastore["RECENT"]
-				run_history = run_history + enum_run_unc("HKU\\#{us.chomp}") if datastore["ENTERED"]
-			end
-		end
+  # Method for enumerating configured shares on a target box
+  #
+  # @return [Array] List of network shares in the form of [ name, type, remark, path ]
+  def enum_conf_shares
+    shares_key = nil
 
-		# Enumerate Mount History
-		if mount_history.length > 0
-			print_status("Recent Mounts found:")
-			mount_history.each do |i|
-				print_status("\t#{i}")
-			end
-			print_status()
-		end
+    [
+      'HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\services\\LanmanServer\\Shares',
+      'HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\services\\lanmanserver\\Shares'
+    ].each do |k|
+      if registry_key_exist?(k)
+        shares_key = k
+        break
+      end
+    end
 
-		# Enumerate UNC Paths entered in the Dialog box
-		if run_history.length > 0
-			print_status("Recent UNC paths entered in Run Dialog found:")
-			run_history.each do |i|
-				print_status("\t#{i}")
-			end
-			print_status()
-		end
+    if shares_key.blank?
+      print_status('No network shares were found')
+      return
+    end
 
-	end
+    share_names = registry_enumvals(shares_key)
 
+    if share_names.empty?
+      print_status('No network shares were found')
+      return
+    end
+
+    shares = []
+    print_status('The following shares were found:')
+    share_names.each do |sname|
+      share_info = registry_getvaldata(shares_key, sname)
+      next if share_info.nil?
+
+      print_status("\tName: #{sname}")
+
+      stype = remark = path = nil
+      share_info.each do |e|
+        name, val = e.split('=')
+        case name
+        when 'Path'
+          path = val
+          print_status "\tPath: #{path}"
+        when 'Type'
+          stype = share_type(val.to_i)
+          print_status "\tType: #{stype}"
+        when 'Remark'
+          remark = val
+          print_status("\tRemark: #{remark}") unless remark.blank?
+        end
+      end
+
+      print_status
+
+      # Match the format used by auxiliary/scanner/smb/smb_enumshares
+      # with an added field for path
+      shares << [ sname, stype, remark, path ]
+    end
+
+    report_note(
+      host: session,
+      type: 'smb.shares',
+      data: { shares: shares },
+      update: :unique_data
+    )
+  end
+
+  def run
+    unless datastore['CURRENT'] || datastore['RECENT'] || datastore['ENTERED']
+      fail_with(Failure::BadConfig, 'At least one option (CURRENT, RECENT, ENTERED) must be enabled. Nothing to do.')
+    end
+
+    hostname = sysinfo.nil? ? cmd_exec('hostname') : sysinfo['Computer']
+    print_status("Running module against #{hostname} (#{session.session_host})")
+
+    enum_conf_shares if datastore['CURRENT']
+
+    return unless datastore['RECENT'] || datastore['ENTERED']
+
+    mount_history = []
+    run_history = []
+
+    if is_system? || is_admin?
+      mount_history = enum_recent_mounts('HKEY_CURRENT_USER') if datastore['RECENT']
+      run_history = enum_run_unc('HKEY_CURRENT_USER') if datastore['ENTERED']
+    else
+      keys = registry_enumkeys('HKU') || []
+      keys.each do |maybe_sid|
+        next unless maybe_sid.starts_with?(SID_PREFIX_USER)
+        next if maybe_sid.include?('_Classes')
+
+        mount_history += enum_recent_mounts("HKU\\#{maybe_sid.chomp}") if datastore['RECENT']
+        run_history += enum_run_unc("HKU\\#{maybe_sid.chomp}") if datastore['ENTERED']
+      end
+    end
+
+    unless mount_history.empty?
+      print_status('Recent mounts found:')
+      mount_history.each do |i|
+        print_status("\t#{i}")
+      end
+      print_status
+    end
+
+    unless run_history.empty?
+      print_status('Recent UNC paths entered in Run dialog found:')
+      run_history.each do |i|
+        print_status("\t#{i}")
+      end
+      print_status
+    end
+  end
 end

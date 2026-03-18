@@ -1,65 +1,64 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+class MetasploitModule < Msf::Auxiliary
+  include Msf::Exploit::Remote::Capture
 
-require 'msf/core'
+  def initialize
+    super(
+      'Name' => 'Pcap Replay Utility',
+      'Description' => %q{
+        Replay a packet capture (PCAP) file.
+      },
+      'Author' => 'amaloteaux',
+      'License' => MSF_LICENSE,
+      'Notes' => {
+        'Stability' => [SERVICE_RESOURCE_LOSS],
+        'SideEffects' => [IOC_IN_LOGS],
+        'Reliability' => []
+      }
+    )
 
-class Metasploit3 < Msf::Auxiliary
+    register_options([
+      OptPath.new('FILENAME', [true, 'The local pcap file to process']),
+      OptString.new('FILE_FILTER', [false, 'The filter string to apply on the file']),
+      OptInt.new('LOOP', [true, 'The number of times to loop through the file', 1]),
+      OptInt.new('DELAY', [true, 'the delay in millisecond between each loop', 0]),
+      OptInt.new('PKT_DELAY', [true, 'the delay in millisecond between each packet', 0]),
+    ])
 
-	include Msf::Exploit::Remote::Capture
+    deregister_options('SNAPLEN', 'FILTER', 'PCAPFILE', 'RHOST', 'TIMEOUT', 'SECRET', 'GATEWAY_PROBE_HOST', 'GATEWAY_PROBE_PORT')
+  end
 
-	def initialize
-		super(
-			'Name'        => 'Pcap replay utility',
-			'Version'     => '$Revision$',
-			'Description' => %q{
-				replay a pcap capture file
-			},
-			'Author'      => 'amaloteaux',
-			'License'     => MSF_LICENSE
-		)
+  def run
+    filename = datastore['FILENAME']
 
-		register_options([
-			OptPath.new('FILENAME', [true, "The local pcap file to process"]),
-			OptString.new('FILE_FILTER', [false, "The filter string to apply on the file"]),
-			OptInt.new('LOOP', [true, "The number of times to loop through the file",1]),
-			OptInt.new('DELAY', [true, "the delay in millisecond between each loop",0]),
-			OptInt.new('PKT_DELAY', [true, "the delay in millisecond between each packet",0]),
-		], self.class)
+    unless File.exist?(filename) && File.file?(filename)
+      print_error('Pcap File does not exist')
+      return
+    end
 
-		deregister_options('SNAPLEN','FILTER','PCAPFILE','RHOST','TIMEOUT','UDP_SECRET','GATEWAY','NETMASK')
-	end
+    check_pcaprub_loaded
 
-	def run
-		check_pcaprub_loaded # Check first
-		pkt_delay = datastore['PKT_DELAY']
-		delay = datastore['DELAY']
-		loop = datastore['LOOP']
-		infinity = true if loop <= 0
-		file_filter = datastore['FILE_FILTER']
-		filename = datastore['FILENAME']
-		verbose = datastore['VERBOSE']
-		count = 0
-		unless File.exists? filename and File.file? filename
-			print_error("Pcap File does not exist")
-			return
-		end
-		open_pcap
-		print_status("Sending file...") unless verbose
-		while (loop > 0 or infinity) do
-			vprint_status("Sending file (loop : #{count = count + 1})")
-			inject_pcap(filename, file_filter, pkt_delay )
-			loop -= 1 unless infinity
-			Kernel.select(nil, nil, nil, (delay * 1.0)/1000) if loop > 0 or infinity
-		end
-		close_pcap
-	end
+    open_pcap
 
+    vprint_status('Sending file...')
+
+    pkt_delay = datastore['PKT_DELAY']
+    delay = datastore['DELAY']
+    iterations = datastore['LOOP']
+    infinity = true if iterations <= 0
+    file_filter = datastore['FILE_FILTER']
+    count = 0
+    while (iterations > 0) || infinity
+      vprint_status("Sending file (iterations: #{count += 1})")
+      inject_pcap(filename, file_filter, pkt_delay)
+      iterations -= 1 unless infinity
+      Kernel.select(nil, nil, nil, (delay * 1.0) / 1000) if (iterations > 0) || infinity
+    end
+
+    close_pcap
+  end
 end

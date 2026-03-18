@@ -1,162 +1,139 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+class MetasploitModule < Msf::Auxiliary
 
+  # Exploit mixins should be called first
+  include Msf::Exploit::Remote::MsWkst
+  include Msf::Exploit::Remote::SMB::Client
+  include Msf::Exploit::Remote::SMB::Client::Authenticated
+  include Msf::Exploit::Remote::DCERPC
 
-require 'msf/core'
+  # Scanner mixin should be near last
+  include Msf::Auxiliary::Scanner
+  include Msf::Auxiliary::Report
 
+  include Msf::OptionalSession::SMB
 
-class Metasploit3 < Msf::Auxiliary
+  def initialize
+    super(
+      'Name' => 'SMB Domain User Enumeration',
+      'Description' => 'Determine what domain users are logged into a remote system via a DCERPC to NetWkstaUserEnum.',
+      'Author' => [
+        'natron', # original module
+        'Joshua D. Abraham <jabra[at]praetorian.com>', # database storage
+        'NtAlexio2 <ntalexio2@gmail.com>', # refactor
+      ],
+      'References' => [
+        [ 'URL', 'https://docs.microsoft.com/en-us/windows/win32/api/lmwksta/nf-lmwksta-netwkstauserenum' ]
+      ],
+      'License' => MSF_LICENSE,
+    )
+  end
 
-	# Exploit mixins should be called first
-	include Msf::Exploit::Remote::SMB
-	include Msf::Exploit::Remote::SMB::Authenticated
-	include Msf::Exploit::Remote::DCERPC
+  def rport
+    @rport
+  end
 
-	# Scanner mixin should be near last
-	include Msf::Auxiliary::Scanner
-	include Msf::Auxiliary::Report
+  def smb_direct
+    @smb_direct
+  end
 
-	def initialize
-		super(
-			'Name'        => 'SMB Domain User Enumeration',
-			'Version'     => '$Revision $',
-			'Description' => 'Determine what domain users are logged into a remote system via a DCERPC to NetWkstaUserEnum.',
-			'Author'      => 'natron',
-			'Version'     => '$Revision$',
-			'References'  =>
-				[
-					[ 'URL', 'http://msdn.microsoft.com/en-us/library/aa370669%28VS.85%29.aspx' ]
-				],
-			'License'     => MSF_LICENSE
-		)
+  def connect(*args, **kwargs)
+    super(*args, **kwargs, direct: @smb_direct)
+  end
 
-		deregister_options('RPORT', 'RHOST')
+  def run_session
+    smb_services = [{ port: self.simple.peerport, direct: self.simple.direct }]
+    smb_services.map { |smb_service| run_service(smb_service[:port], smb_service[:direct]) }
+  end
 
-	end
+  def run_rhost
+    if datastore['RPORT'].blank? || datastore['RPORT'] == 0
+      smb_services = [
+        { port: 445, direct: true },
+        { port: 139, direct: false }
+      ]
+    else
+      smb_services = [
+        { port: datastore['RPORT'], direct: datastore['SMBDirect'] }
+      ]
+    end
 
-	def parse_value(resp, idx)
-		#val_length  = resp[idx,4].unpack("V")[0]
-		idx += 4
-		#val_offset = resp[idx,4].unpack("V")[0]
-		idx += 4
-		val_actual = resp[idx,4].unpack("V")[0]
-		idx += 4
-		value	= resp[idx,val_actual*2]
-		#print_debug "resp[0x#{idx.to_s(16)},#{val_actual*2}] : " + value
-		idx += val_actual * 2
+    smb_services.map { |smb_service| run_service(smb_service[:port], smb_service[:direct]) }
+  end
 
-		idx += val_actual % 2 * 2 # alignment
+  def run_service(port, direct)
+    @rport = port
+    @smb_direct = direct
 
-		return value,idx
-	end
+    ipc_tree = connect_ipc
+    wkssvc_pipe = connect_wkssvc(ipc_tree)
+    endpoint = RubySMB::Dcerpc::Wkssvc.freeze
 
-	def parse_NetWkstaEnumUsersInfo(resp)
-		accounts = [ Hash.new() ]
+    user_info = user_enum(endpoint::WKSTA_USER_INFO_1)
+    user_info.wkui1_buffer
+  rescue Msf::Exploit::Remote::SMB::Client::Ipc::SmbIpcAuthenticationError => e
+    print_warning(e.message)
+    nil
+  rescue RubySMB::Error::RubySMBError => e
+    print_error("Error: #{e.message}")
+    nil
+  rescue ::Timeout::Error
+  rescue ::Exception => e
+    print_error("Error: #{e.class} #{e}")
+    nil
+  ensure
+    disconnect_wkssvc
+  end
 
-		#print_debug resp[0,20].unpack("H*")
-		idx = 20
-		count = resp[idx,4].unpack("V")[0] # wkssvc_NetWkstaEnumUsersInfo -> Info -> PtrCt0 -> User() -> Ptr -> Max Count
-		idx += 4
-		#print_debug "Max Count  : " + count.to_s
+  def run_host(_ip)
+    if session
+      self.simple = session.simple_client
+      results = run_session
+    else
+      results = run_rhost
+    end
 
-		1.upto(count) do
-			# wkssvc_NetWkstaEnumUsersInfo -> Info -> PtrCt0 -> User() -> Ptr -> Ref ID
-			# print_debug "Ref ID#{account.to_s}: " + resp[idx,4].unpack("H*").to_s
-			idx += 4 # ref id name
-			idx += 4 # ref id logon domain
-			idx += 4 # ref id other domains
-			idx += 4 # ref id logon server
-		end
+    unless results.to_s.empty?
+      accounts = [ Hash.new() ]
+      results.compact.each do |result_set|
+        result_set.each { |result|
+          accounts << {
+            :account_name => result.wkui1_username.encode('UTF-8'),
+            :logon_domain => result.wkui1_logon_domain.encode('UTF-8'),
+            :other_domains => result.wkui1_oth_domains.encode('UTF-8'),
+            :logon_server => result.wkui1_logon_server.encode('UTF-8')
+          }
+        }
+      end
+      accounts.shift
 
-		1.upto(count) do
-			# wkssvc_NetWkstaEnumUsersInfo -> Info -> PtrCt0 -> User() -> Ptr -> ID1 max count
+      if datastore['VERBOSE']
+        accounts.each do |x|
+          print_status x[:logon_domain] + "\\" + x[:account_name] +
+                       "\t(logon_server: #{x[:logon_server]}, other_domains: #{x[:other_domains]})"
+        end
+      else
+        print_status "#{accounts.collect { |x| x[:logon_domain] + "\\" + x[:account_name] }.join(", ")}"
+      end
 
-			account_name,idx	= parse_value(resp, idx)
-			logon_domain,idx	= parse_value(resp, idx)
-			other_domains,idx	= parse_value(resp, idx)
-			logon_server,idx	= parse_value(resp, idx)
+      found_accounts = []
+      accounts.each do |x|
+        comp_user = x[:logon_domain] + "\\" + x[:account_name]
+        found_accounts.push(comp_user.scan(/[[:print:]]/).join) unless found_accounts.include?(comp_user.scan(/[[:print:]]/).join)
+      end
 
-			accounts << {
-				:account_name => account_name,
-				:logon_domain => logon_domain,
-				:other_domains => other_domains,
-				:logon_server => logon_server
-			}
-		end
+      found_accounts.each do |comp_user|
+        if comp_user.to_s =~ /\$$/
+          next
+        end
 
-		accounts
-	end
+        print_good("Found user: #{comp_user}")
+      end
 
-	def run_host(ip)
-
-		[[139, false], [445, true]].each do |info|
-
-		datastore['RPORT'] = info[0]
-		datastore['SMBDirect'] = info[1]
-
-		begin
-			connect()
-			smb_login()
-
-			uuid = [ '6bffd098-a112-3610-9833-46c3f87e345a', '1.0' ]
-
-			handle = dcerpc_handle(
-				uuid[0], uuid[1], 'ncacn_np', ["\\wkssvc"]
-			)
-			begin
-				dcerpc_bind(handle)
-				stub =
-					NDR.uwstring("\\\\" + ip) +	# Server Name
-					NDR.long(1) +						# Level
-					NDR.long(1) +						# Ctr
-					NDR.long(rand(0xffffffff)) +	# ref id
-					NDR.long(0) +						# entries read
-					NDR.long(0) +						# null ptr to user0
-
-					NDR.long(0xffffffff) +			# Prefmaxlen
-					NDR.long(rand(0xffffffff)) +	# ref id
-					NDR.long(0)							# null ptr to resume handle
-
-				dcerpc.call(2,stub)
-
-				resp = dcerpc.last_response ? dcerpc.last_response.stub_data : nil
-
-				accounts = parse_NetWkstaEnumUsersInfo(resp)
-				accounts.shift
-
-				if datastore['VERBOSE']
-					accounts.each do |x|
-						print_status ip + " : " + x[:logon_domain] + "\\" + x[:account_name] +
-							"\t(logon_server: #{x[:logon_server]}, other_domains: #{x[:other_domains]})"
-					end
-				else
-					print_status "#{ip} : #{accounts.collect{|x| x[:logon_domain] + "\\" + x[:account_name]}.join(", ")}"
-				end
-
-			rescue ::Rex::Proto::SMB::Exceptions::ErrorCode => e
-				print_line("UUID #{uuid[0]} #{uuid[1]} ERROR 0x%.8x" % e.error_code)
-				#puts e
-				#return
-			rescue ::Exception => e
-				print_line("UUID #{uuid[0]} #{uuid[1]} ERROR #{$!}")
-				#puts e
-				#return
-			end
-
-			disconnect()
-			return
-		rescue ::Exception
-			print_line($!.to_s)
-		end
-	end
-end
-
+    end
+  end
 end

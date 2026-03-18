@@ -1,138 +1,131 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
-
-require 'msf/core'
 require 'yaml'
 
-class Metasploit3 < Msf::Auxiliary
+class MetasploitModule < Msf::Auxiliary
+  include Msf::Exploit::Remote::MYSQL
+  include Msf::Auxiliary::Report
+  include Msf::Auxiliary::Scanner
+  include Msf::OptionalSession::MySQL
 
-	include Msf::Exploit::Remote::MYSQL
-	include Msf::Auxiliary::Report
+  def initialize
+    super(
+      'Name' => 'MYSQL Schema Dump',
+      'Description' => %Q{
+          This module extracts the schema information from a
+          MySQL DB server.
+      },
+      'Author' => ['theLightCosine'],
+      'License' => MSF_LICENSE
+    )
 
-	include Msf::Auxiliary::Scanner
+    register_options([
+      OptBool.new('DISPLAY_RESULTS', [true, "Display the Results to the Screen", true])
+    ])
+  end
 
-	def initialize
-		super(
-			'Name'           => 'MYSQL Schema Dump',
-			'Version'        => '$Revision$',
-			'Description'    => %Q{
-					This module extracts the schema information from a
-					MySQL DB server.
-			},
-			'Author'         => ['TheLightCosine <thelightcosine[at]gmail.com>'],
-			'License'        => MSF_LICENSE
-		)
+  def run_host(ip)
+    # If we have a session make use of it
+    if session
+      print_status("Using existing session #{session.sid}")
+      self.mysql_conn = session.client
+    else
+      # otherwise fallback to attempting to login
+      return unless mysql_login_datastore
+    end
 
-		register_options([
-			OptBool.new('DISPLAY_RESULTS', [true, "Display the Results to the Screen", true])
-			])
+    mysql_schema = get_schema
+    mysql_schema.each do |db|
+      report_note(
+        :host => mysql_conn.peerhost,
+        :type => "mysql.db.schema",
+        :data => { :database => db },
+        :port => mysql_conn.peerport,
+        :proto => 'tcp',
+        :update => :unique_data
+      )
+    end
+    output = "MySQL Server Schema \n Host: #{mysql_conn.peerhost} \n Port: #{mysql_conn.peerport} \n ====================\n\n"
+    output << YAML.dump(mysql_schema)
+    this_service = report_service(
+      :host => mysql_conn.peerhost,
+      :port => mysql_conn.peerport,
+      :name => 'mysql',
+      :proto => 'tcp'
+    )
+    p = store_loot('mysql_schema', "text/plain", mysql_conn.peerhost, output, "#{mysql_conn.peerhost}_mysql_schema.txt", "MySQL Schema", this_service)
+    print_good("Schema stored in: #{p}")
+    print_good output if datastore['DISPLAY_RESULTS']
+  end
 
-	end
+  def get_schema
+    mysql_schema = []
+    res = mysql_query("show databases")
+    if res.size > 0
+      res.each do |row|
+        next if row[0].nil?
+        next if row[0].empty?
+        next if row[0] == "information_schema"
+        next if row[0] == "mysql"
+        next if row[0] == "performance_schema"
+        next if row[0] == "test"
 
-	def run_host(ip)
+        tmp_db = {}
+        tmp_db['DBName'] = row[0]
+        tmp_db['Tables'] = []
+        tmp_tblnames = get_tbl_names(row[0])
+        unless tmp_tblnames.nil? or tmp_tblnames.empty?
+          tmp_tblnames.each do |table_name|
+            tmp_tbl = {}
+            tmp_tbl['TableName'] = table_name
+            tmp_tbl['Columns'] = []
+            tmp_clmnames = get_columns(tmp_db['DBName'], table_name)
+            unless tmp_clmnames.nil? or tmp_clmnames.empty?
+              tmp_clmnames.each do |column|
+                tmp_column = {}
+                tmp_column['ColumnName'] = column[0]
+                tmp_column['ColumnType'] = column[1]
+                tmp_tbl['Columns'] << tmp_column
+              end
+            end
+            tmp_db['Tables'] << tmp_tbl
+          end
+        end
+        mysql_schema << tmp_db
+      end
+    end
+    return mysql_schema
+  end
 
-		if (not mysql_login_datastore)
-			print_error("Invalid MySQL Server credentials")
-			return
-		end
-		mysql_schema = get_schema
-		mysql_schema.each do |db|
-			report_note(
-				:host  => rhost,
-				:type  => "mysql.db.schema",
-				:data  => db,
-				:port  => rport,
-				:proto => 'tcp',
-				:update => :unique_data
-			)
-		end
-		output = "MySQL Server Schema \n Host: #{datastore['RHOST']} \n Port: #{datastore['RPORT']} \n ====================\n\n"
-		output << YAML.dump(mysql_schema)
-		this_service = report_service(
-					:host  => datastore['RHOST'],
-					:port => datastore['RPORT'],
-					:name => 'mysql',
-					:proto => 'tcp'
-					)
-		p = store_loot('mysql_schema', "text/plain", datastore['RHOST'], output, "#{datastore['RHOST']}_mysql_schema.txt", "MySQL Schema", this_service)
-		print_status("Schema stored in: #{p}")
-		print_good output if datastore['DISPLAY_RESULTS']
-	end
+  # Gets all of the Tables names inside the given Database
+  def get_tbl_names(dbname)
+    tables = []
+    res = mysql_query("SHOW tables from #{dbname}")
+    if res.size > 0
+      res.each do |row|
+        next if row[0].nil?
+        next if row[0].empty?
 
+        tables << row[0]
+      end
+    end
+    return tables
+  end
 
-	def get_schema
-		mysql_schema=[]
-		res = mysql_query("show databases")
-		if res.size > 0
-			res.each do |row|
-				next if row[0].nil?
-				next if row[0].empty?
-				next if row[0]== "information_schema"
-				next if row[0]== "mysql"
-				next if row[0]== "performance_schema"
-				next if row[0]== "test"
-				tmp_db ={}
-				tmp_db['DBName'] = row[0]
-				tmp_db['Tables'] = []
-				tmp_tblnames = get_tbl_names(row[0])
-				unless tmp_tblnames.nil? or tmp_tblnames.empty?
-					tmp_tblnames.each do |table_name|
-						tmp_tbl={}
-						tmp_tbl['TableName'] = table_name
-						tmp_tbl['Columns'] = []
-						tmp_clmnames = get_columns(tmp_db['DBName'],table_name)
-						unless tmp_clmnames.nil? or tmp_clmnames.empty?
-							tmp_clmnames.each do |column|
-								tmp_column = {}
-								tmp_column['ColumnName'] = column[0]
-								tmp_column['ColumnType'] = column[1]
-								tmp_tbl['Columns'] << tmp_column
-							end
-						end
-						tmp_db['Tables'] << tmp_tbl
-					end
-				end
-				mysql_schema << tmp_db
-			end
-		end
-		return mysql_schema
-	end
+  def get_columns(db_name, tbl_name)
+    tables = []
+    res = mysql_query("desc #{db_name}.#{tbl_name}")
+    if res.size > 0
+      res.each do |row|
+        next if row[0].nil?
+        next if row[0].empty?
 
-	#Gets all of the Tables names inside the given Database
-	def get_tbl_names(dbname)
-
-		tables=[]
-		res = mysql_query("SHOW tables from #{dbname}")
-		if res.size > 0
-			res.each do |row|
-				next if row[0].nil?
-				next if row[0].empty?
-				tables<<row[0]
-			end
-		end
-		return tables
-
-	end
-
-	def get_columns(db_name,tbl_name)
-		tables=[]
-		res = mysql_query("desc #{db_name}.#{tbl_name}")
-		if res.size > 0
-			res.each do |row|
-				next if row[0].nil?
-				next if row[0].empty?
-				tables<< [row[0],row[1]]
-			end
-		end
-		return tables
-	end
-
+        tables << [row[0], row[1]]
+      end
+    end
+    return tables
+  end
 end

