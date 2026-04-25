@@ -8,7 +8,7 @@ require 'ruby_smb/gss/provider/ntlm'
 
 class MetasploitModule < Msf::Auxiliary
   include ::Msf::Exploit::Remote::SMB::Server
-  include ::Msf::Exploit::Remote::SMB::Server::HashCapture
+  include ::Msf::Exploit::Remote::Relay::NTLM::HashCapture
 
   def initialize
     super({
@@ -64,7 +64,8 @@ class MetasploitModule < Msf::Auxiliary
 
   def start_service(opts = {})
     ntlm_provider = HashCaptureNTLMProvider.new(
-      listener: self
+      listener: self,
+      service_name: 'SMB'
     )
 
     # Set domain name for all future server responses
@@ -72,7 +73,7 @@ class MetasploitModule < Msf::Auxiliary
     ntlm_provider.dns_hostname = datastore['SMBDomain']
     ntlm_provider.netbios_domain = datastore['SMBDomain']
     ntlm_provider.netbios_hostname = datastore['SMBDomain']
-    validate_smb_hash_capture_datastore(datastore, ntlm_provider)
+    validate_hash_capture_datastore(datastore, ntlm_provider)
     opts[:gss_provider] = ntlm_provider
 
     super(opts)

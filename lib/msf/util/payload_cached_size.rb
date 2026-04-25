@@ -30,7 +30,9 @@ class PayloadCachedSize
       'DNSZONE' => 'corelan.eu',
       'PEXEC' => '/bin/sh',
       'HttpUserAgent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:94.0) Gecko/20100101 Firefox/94.0',
-      'StagerURILength' => 5
+      'StagerURILength' => 5,
+      'FD' => 100,
+      'MeterpreterDebugBuild' => false
     },
     'Encoder'     => nil,
     'DisableNops' => true
@@ -47,14 +49,14 @@ class PayloadCachedSize
   }.freeze
 
   OPTS_IPV4 = {
-    'LHOST' => '255.255.255.255',
+    'LHOST' => '223.255.255.255',
     'RHOST' => '255.255.255.255',
     'KHOST' => '255.255.255.255',
     'AHOST' => '255.255.255.255'
   }.freeze
 
   OPTS_IPV6 = {
-    'LHOST' => 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
+    'LHOST' => 'fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
     'RHOST' => 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
     'KHOST' => 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
     'AHOST' => 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'
